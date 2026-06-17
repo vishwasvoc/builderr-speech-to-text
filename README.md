@@ -2,7 +2,7 @@
 
 Build a **local, dual-language** speech-to-text engine — **Hindi + English** to start —
 that beats the best free local tools on real code-switched work speech, **with no cloud
-calls during scoring**. Prize: **$250**. Full brief: [`AGENT_BRIEF.md`](AGENT_BRIEF.md).
+calls during scoring**. Prize: **$500**. Full brief: [`AGENT_BRIEF.md`](AGENT_BRIEF.md).
 
 > Dual-language = two languages mixed in one utterance (code-switching). We open with
 > Hindi+English; the same harness extends to other pairs (e.g. Chinese+English) later.
