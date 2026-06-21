@@ -51,6 +51,23 @@ full story): a **fast recognizer** for the common English case, a **router** tha
 Hindi-mixed clips, a **stronger Hindi-capable model** for just those, and a **finalizer** that
 keeps it faithful without hanging or repeating. You don't have to copy it — but that shape works.
 
+## 4b. The streaming track — where the $500 is decided
+
+The prize is decided on **live dictation**: drafting text *as you speak* and finalizing fast, not
+just transcribing a finished clip. You write **one more function** — `draft()` in
+[`solution/draft.py`](solution/draft.py) — that emits text as audio arrives and commits what won't
+change. The server and the real-time audio feed are a **sealed harness we provide**; you do not
+build a server.
+
+```bash
+pip install -r requirements.txt -r requirements-streaming.txt
+python preview_stream.py        # streams samples/ through your draft(), prints the streaming score
+```
+
+The contract, scoring, caps, frozen-CPU bar, and RambleFix's published numbers are the single
+source of truth: [`docs/STREAMING_CONTRACT.md`](docs/STREAMING_CONTRACT.md). One combined score,
+one $500 prize, RambleFix is the benchmark to beat.
+
 ## 5. Check yourself before you submit
 
 ```bash

@@ -23,6 +23,10 @@ from dataclasses import dataclass, field
 _WORD = re.compile(r"[a-z0-9']+")
 _NEG = {"no", "not", "n't", "never", "without", "dont", "don't", "cannot", "can't", "nahi", "mat"}
 
+# Shared latency bar (ms): batch counts a clip as a hang past this; the streaming
+# track caps end-to-final past this. One bar, imported by streaming_scorecard.py.
+LATENCY_BAR_MS = 5000
+
 
 def normalize(text: str) -> list[str]:
     return _WORD.findall((text or "").lower())
@@ -178,7 +182,7 @@ def score_run(rows: list[dict]) -> dict:
         total = t.get("total")
         if total is not None:
             lat.append(total)
-        if total is not None and total > 5000:
+        if total is not None and total > LATENCY_BAR_MS:
             hangs += 1
         cr = score_clip(r["gold"], r.get("pred", ""), r.get("must_have"),
                         t, bool(r.get("local_only")), r.get("audit"), r.get("clip_id", ""))

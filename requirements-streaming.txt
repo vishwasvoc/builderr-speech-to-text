@@ -1,0 +1,7 @@
+# Optional deps for the STREAMING dictation track only.
+# The batch track (requirements.txt) stays minimal — install this only if you
+# build / preview the streaming entry (solution/draft.py + the sealed server).
+websockets>=12        # loopback WebSocket transport between evaluator and stream_server
+# (numpy is used by evaluator.py for per-run anti-replay jitter; most ASR stacks
+#  already pull it in. Uncomment if you have a bare environment.)
+# numpy>=1.24

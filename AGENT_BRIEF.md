@@ -83,6 +83,13 @@ Cloud APIs are allowed during development if the builder wants, but the official
 
 ## Submission Contract
 
+> **Streaming track ($500):** the prize is decided on live dictation. Entrants also
+> implement one function, `draft()` in `solution/draft.py`, that emits text as audio
+> arrives; the streaming server and real-time feed are a sealed harness we provide
+> (`solution/stream_server.py`). One combined score; RambleFix is the benchmark line.
+> Full contract, scoring, caps, and published numbers:
+> [`docs/STREAMING_CONTRACT.md`](docs/STREAMING_CONTRACT.md).
+
 Entrants provide a repo that exposes this command:
 
 ```bash

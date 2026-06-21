@@ -79,6 +79,31 @@ Emit the JSON in [`solution/transcribe.py`](solution/transcribe.py) (`text`, `mo
 `language_guess`, `timings_ms`, `raw_candidates`, `model_ids`, `local_only`).
 Modes: `auto` / `fast` / `hinglish` / `verbatim`.
 
+## The streaming dictation track — where the $500 is
+
+There's one prize, **$500**, on one combined score, decided on **live dictation**:
+your tool has to draft text *as you speak* and finalize fast, not just transcribe a
+finished clip. You write **one function** — `draft()` in
+[`solution/draft.py`](solution/draft.py) — that emits text as audio arrives and
+commits what won't change. The streaming server and the real-time audio feed are a
+**sealed harness we provide** ([`solution/stream_server.py`](solution/stream_server.py)) —
+you do not build a server.
+
+You're scored on one combined number: meaning + Hindi-English-mix correctness on
+the final, plus live feel (how fast the final lands after you stop, time to the
+first useful partial, and whether committed text gets rewritten), plus reliability.
+**RambleFix is the benchmark line to beat — it can't win the prize.**
+
+The full contract, scoring, caps, frozen-CPU bar, and RambleFix's published numbers
+are the single source of truth in
+[**`docs/STREAMING_CONTRACT.md`**](docs/STREAMING_CONTRACT.md). Preview yourself,
+offline, exactly like admission:
+
+```bash
+pip install -r requirements.txt -r requirements-streaming.txt
+python preview_stream.py
+```
+
 ## Run the local preview (scores you exactly like admission, offline)
 
 ```bash
@@ -116,6 +141,8 @@ on a Linux box, and you land on the board.
 ## Tests
 
 ```bash
-python tests/test_scorecard.py     # scoring is fair + un-gameable
-python tests/test_no_network.py    # offline enforcement works
+python tests/test_scorecard.py            # batch scoring is fair + un-gameable
+python tests/test_no_network.py           # offline enforcement works
+pytest tests/test_streaming_scorecard.py  # streaming scoring: churn / TTFS / latency caps
+pytest tests/test_stream_contract.py      # the sealed streaming server speaks the contract
 ```
