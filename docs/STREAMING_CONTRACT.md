@@ -182,9 +182,10 @@ machine's on-device accelerator (GPU / Apple Neural Engine) is available to the
 scored process — outbound **network is blocked** after model warmup. The exact
 machine is pinned here at launch and does not change for the round:
 
-> **Frozen box (pinned):** Apple M1 Pro · 8-core CPU (6P + 2E) + integrated GPU +
-> 16-core Neural Engine · 32 GB RAM · macOS 26.3 · accelerator on, **network blocked**
-> after model warmup. The §3.1 latency knees are calibrated to this machine.
+> **Frozen box (pinned):** MacBook Pro 14-inch (2021) · Apple M1 Pro · 8-core CPU
+> (6P + 2E) + GPU + 16-core Neural Engine · 32 GB RAM · macOS Tahoe 26.3.1 ·
+> accelerator on, **network blocked** after model warmup. The §3.1 latency knees are
+> calibrated to this machine.
 
 ---
 
