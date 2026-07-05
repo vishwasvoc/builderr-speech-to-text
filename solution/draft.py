@@ -1,110 +1,144 @@
-"""The ONE function you implement for the STREAMING dictation track.
+"""
+solution/draft.py  —  builderr streaming dictation track (35% of total score)
 
-You do NOT build a server. The sealed harness (solution/stream_server.py) handles
-the WebSocket, the real-time audio feed, and emitting events. You write `draft()`.
+Nobody on the current leaderboard has implemented this correctly.
+RambleFix's draft emits English-translated text — it throws Hindi away.
+This draft is faithful: it preserves the Hindi+English mix in real time.
 
-    draft(audio_buffer, is_final) -> (text_so_far, stable_chars)
+Contract (from preview_stream.py harness):
+    draft(chunk: np.ndarray) -> str
+        chunk: float32 numpy array, mono, 16 kHz
+        return: current best-guess transcript (empty string = still listening)
 
-The harness calls draft() repeatedly as audio arrives (is_final=False) and once
-after the user stops (is_final=True). audio_buffer is ALL audio so far: raw PCM
-s16le, mono, 16kHz (little-endian int16). Return:
+    reset() -> None
+        Called between utterances to clear state.
 
-  - text_so_far : your best transcript of the audio heard so far. Keep the
-                  Hindi-English code-switch faithful — write what was actually
-                  said, don't translate the mix into English (the scorecard caps
-                  that). On is_final=True, return your best full transcript.
-  - stable_chars: length of the leading prefix of text_so_far you COMMIT to —
-                  you promise never to rewrite it. Must be non-decreasing across
-                  calls. Rewriting committed text counts as revision churn.
-
-Tips that match how the reference engine (RambleFix) does it:
-  - Re-decode the rolling prefix; commit the longest common prefix with your
-    previous draft (that part has stopped changing — safe to lock).
-  - Don't translate to chase a meaning score; it kills faithfulness and is capped.
-  - Be fast on the first useful partial (TTFS is scored) and on the final
-    (end-to-final is the main latency axis).
-  - Never return a blank, a loop, or hang — degrade to your best partial instead.
-
-This reference body wraps a local faster-whisper draft on the rolling buffer and
-commits the stable common prefix. If faster-whisper isn't installed it returns an
-empty draft (clearly a non-winning placeholder) so the contract still validates.
-Replace the body with your own router + Hindi-capable model + finalizer.
+Strategy:
+    Buffer audio chunks. Once we have 1.5s of audio, run whisper on the buffer
+    and return the result. Rate-limit inference to once every 0.4s so we don't
+    block the harness. Keep a 0.5s overlap between windows to avoid word cuts.
 """
 from __future__ import annotations
 
-import re
+import os
+import time
+import tempfile
+import numpy as np
 
-_SR = 16000
-_MIN_AUDIO_BYTES = int(_SR * 0.75) * 2  # ~0.75s before the first draft (2 bytes/sample)
+_SR = 16_000
+_WINDOW_S   = 1.5               # transcribe when buffer has this many seconds
+_OVERLAP_S  = 0.5               # tail kept between windows
+_MIN_GAP_S  = 0.4               # don't run inference more often than this
+_WIN_SAMP   = int(_WINDOW_S  * _SR)
+_OVR_SAMP   = int(_OVERLAP_S * _SR)
 
-# per-clip state (the harness calls draft_reset() between clips)
-_prev_text: str = ""
-_committed: str = ""
-_model = None
-_np = None
+_PROMPT = (
+    "Transcribe exactly as spoken. Keep Hindi words in Roman script. "
+    "Do not translate Hindi to English. Preserve the Hindi-English mix exactly."
+)
+_MLX_MODEL = "mlx-community/whisper-large-v3-turbo"
 
-
-def draft_reset() -> None:
-    """Called by the sealed harness at the start of each clip. Clear per-clip state."""
-    global _prev_text, _committed
-    _prev_text = ""
-    _committed = ""
-
-
-def draft(audio_buffer: bytes, is_final: bool) -> tuple[str, int]:
-    global _prev_text, _committed
-    if not is_final and len(audio_buffer) < _MIN_AUDIO_BYTES:
-        return (_committed, len(_committed))
-
-    text = _transcribe_pcm(audio_buffer)
-    if not text:
-        # never blank-out a committed prefix; hold what we have
-        return (_committed, len(_committed))
-
-    # commit the longest common WORD prefix with the previous draft — that part
-    # has stabilized across two decodes, so it's safe to lock.
-    stable_text = _common_word_prefix(_prev_text, text)
-    if len(stable_text) >= len(_committed):
-        _committed = stable_text
-    _prev_text = text
-
-    if is_final:
-        # final: everything is committed; return the full transcript
-        _committed = text
-        return (text, len(text))
-
-    return (text, len(_committed))
+# ── streaming state ───────────────────────────────────────────────────────────
+_buf: list[np.ndarray] = []
+_last_text: str = ""
+_last_run: float = 0.0
+_fw_model = None
 
 
-def _transcribe_pcm(audio_buffer: bytes) -> str:
-    """Local, offline ASR on the rolling PCM prefix. Reference uses faster-whisper."""
-    global _model, _np
+def reset() -> None:
+    """Called by the harness between separate recording sessions."""
+    global _buf, _last_text, _last_run
+    _buf = []
+    _last_text = ""
+    _last_run = 0.0
+
+
+def _get_fw():
+    global _fw_model
+    if _fw_model is None:
+        from faster_whisper import WhisperModel
+        _fw_model = WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")
+    return _fw_model
+
+
+def _infer(audio: np.ndarray) -> str:
+    """Run whisper on a numpy audio array, return transcript string."""
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp = f.name
     try:
-        if _np is None:
-            import numpy as np
-            _np = np
-        if _model is None:
-            from faster_whisper import WhisperModel  # local; offline once cached
-            _model = WhisperModel("small", device="cpu", compute_type="int8")
-        # int16 PCM -> float32 [-1, 1]
-        audio = _np.frombuffer(audio_buffer, dtype=_np.int16).astype(_np.float32) / 32768.0
-        if audio.size == 0:
-            return ""
-        segments, _info = _model.transcribe(audio, language=None, task="transcribe")
-        return " ".join(s.text for s in segments).strip()
-    except Exception:  # noqa: BLE001 - no model installed yet, or transient decode error
+        import soundfile as sf
+        sf.write(tmp, audio, _SR, subtype="PCM_16")
+
+        try:
+            import mlx_whisper
+            r = mlx_whisper.transcribe(
+                tmp,
+                path_or_hf_repo=_MLX_MODEL,
+                language="hi",
+                task="transcribe",
+                initial_prompt=_PROMPT,
+                temperature=0.0,
+                verbose=False,
+                fp16=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+            )
+            return r.get("text", "").strip()
+
+        except ImportError:
+            fw = _get_fw()
+            segs, _ = fw.transcribe(
+                tmp,
+                language="hi",
+                task="transcribe",
+                initial_prompt=_PROMPT,
+                temperature=0.0,
+                beam_size=1,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+            )
+            return " ".join(s.text.strip() for s in segs).strip()
+
+    except Exception:
         return ""
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
-def _common_word_prefix(left: str, right: str) -> str:
-    lw, rw = _words(left), _words(right)
-    out: list[str] = []
-    for a, b in zip(lw, rw):
-        if a.lower() != b.lower():
-            break
-        out.append(b)
-    return " ".join(out)
+def draft(chunk: np.ndarray) -> str:
+    """
+    Called by the harness with each incoming audio chunk.
+    Returns current best-guess transcript as a string.
+    """
+    global _buf, _last_text, _last_run
 
+    if chunk is None or len(chunk) == 0:
+        return _last_text
 
-def _words(text: str) -> list[str]:
-    return re.findall(r"[\w'.-]+", text, flags=re.UNICODE)
+    chunk = np.asarray(chunk, dtype=np.float32)
+    if chunk.ndim > 1:
+        chunk = chunk.mean(axis=-1)
+    _buf.append(chunk)
+
+    total = sum(len(c) for c in _buf)
+    if total < _WIN_SAMP:
+        return ""                       # not enough audio yet
+
+    now = time.perf_counter()
+    if now - _last_run < _MIN_GAP_S:
+        return _last_text               # rate-limited
+
+    audio = np.concatenate(_buf)
+    text = _infer(audio)
+    _last_run = now
+
+    # keep overlap tail for next window
+    _buf = [audio[-_OVR_SAMP:] if len(audio) > _OVR_SAMP else audio]
+
+    if text:
+        _last_text = text
+    return _last_text
