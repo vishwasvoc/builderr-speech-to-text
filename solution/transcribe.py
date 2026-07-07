@@ -99,7 +99,7 @@ def _run_fw(audio_path: str) -> str:
     return _clean(" ".join(s.text.strip() for s in segs))
 
 
-def transcribe(audio_path: str) -> str:
+def transcribe(audio_path: str,mode:str = "auto") -> str:
     """
     Transcribe a Hindi+English audio file.
 
