@@ -1,74 +1,64 @@
 """
 solution/draft.py
 ------------------
-Streaming counterpart to solution/transcribe.py.
+Implements the REAL streaming contract, confirmed from
+docs/STREAMING_CONTRACT.md:
 
-⚠️ IMPORTANT CAVEAT — READ BEFORE TRUSTING THIS BLINDLY ⚠️
-I (the AI that wrote this) could not fetch your repo's actual
-docs/STREAMING_CONTRACT.md or the original solution/draft.py stub —
-GitHub blocks automated access to this specific private/small repo from
-where I'm working. Everything below is built from the public challenge
-copy you pasted earlier (GETTING_STARTED.md's "4b. The streaming track"
-section), which describes the *shape* of the contract but not the exact
-function signature or return schema.
+    def draft(audio_buffer: bytes, is_final: bool) -> tuple[str, int]:
+        # audio_buffer = ALL audio heard so far (PCM s16le, mono, 16kHz)
+        # called repeatedly as audio arrives (is_final=False), once more
+        # after the user stops (is_final=True)
+        # returns (text_so_far, stable_chars)
 
-Your last error was:
-    stream server failed before READY (draft_reset import issue)
+    - text_so_far: best transcript of the audio so far. Must keep the
+      Hindi-English code-switch faithful (never translate the mix).
+    - stable_chars: length of the committed leading prefix of
+      text_so_far. Must be NON-DECREASING across calls, and that
+      prefix string may only be EXTENDED, never rewritten.
 
-That almost certainly means stream_server.py does something like:
-    from solution.draft import draft, draft_reset
-...and solution/draft.py either didn't exist, or didn't define both
-names. This file defines both. If you get a NEW error after this (e.g. a
-TypeError about arguments, or a different missing name), that's actually
-good news — it means we're past the import stage and into an argument
-mismatch, which is a small, fast fix. Paste me the new traceback and
-I'll adjust the signature immediately.
+Design, matching how it's actually scored (docs/STREAMING_CONTRACT.md
+section 3): final meaning (40) + critical facts (20) = 60 of 100 points,
+judged ONCE on the final call only. End-to-final latency is 25 points
+(target ~2s). TTFS (5) and revision churn (5) are the only things partial
+calls affect. So: partials exist to protect the TTFS/churn/no-partial
+hard-caps cheaply - they are NOT where quality points are won. The full
+quality+latency budget goes into the final pass.
 
---------------------------------------------------------------------
-What this implements (best-effort, pending contract confirmation):
+Two behaviors follow from that:
 
-    draft_reset()
-        Called once per new audio stream/clip. Clears all internal
-        buffers/state so streams don't bleed into each other.
+1. Partial calls only re-transcribe the *uncommitted tail* of the audio
+   (not the whole growing buffer) with a cheap model, so cost stays
+   roughly constant no matter how long the clip gets. A prefix is only
+   committed once it has matched across two consecutive tail passes AND
+   a trailing safety margin is held back - because per 3.2, committed
+   tokens that don't survive into the FINAL count as churn even if we
+   personally never "rewrote" them - so being trigger-happy about
+   committing hurts even without technically breaking the
+   never-rewrite rule.
 
-    draft(audio_chunk, sample_rate=16000, is_final=False)
-        Called repeatedly as real-time audio arrives (the harness feeds
-        it small chunks, e.g. ~100-300ms at a time). Returns a dict:
+2. is_final=True ignores all the incremental/tail machinery and
+   re-transcribes the FULL buffer once with the strong, faithful
+   pipeline (fast pass -> escalate to the Hindi-capable model if
+   code-switched -> romanize Devanagari -> repetition guard) - the
+   exact same logic solution/transcribe.py uses in "auto" mode, reused
+   directly so both paths agree.
 
-            {
-                "text":      str,  # full best-effort text so far
-                "committed": str,  # the prefix that is now considered
-                                    # stable and should not be rewritten
-                "partial":   str,  # the trailing, still-changing part
-            }
-
-    Accepts audio_chunk as either raw int16 PCM bytes or a numpy array
-    (float32 in [-1, 1] or int16) - normalizes internally either way,
-    since I don't know for certain which the harness sends.
-
-Design, matching the challenge's stated goals:
-    - A cheap, fast partial pass runs every ~0.5s of new audio so the
-      "time to first useful partial" score component stays low.
-    - Text is only "committed" once it has been stable across two
-      consecutive partial passes - this avoids the score penalty for
-      "committed text getting rewritten" while still surfacing partials
-      fast.
-    - On is_final=True (or after a detected pause), a stronger pass
-      re-transcribes the whole utterance using the same faithful
-      (transcribe, never translate) + Hindi-routing + romanization logic
-      as solution/transcribe.py, reused directly from that module so
-      both paths behave identically. This is what the ~60%
-      accuracy+mix scoring weight is paying for - worth the extra
-      latency budget since speed is only ~35%.
-    - Uses beam_size=1 for the frequent partial passes (cheap) and the
-      full beam_size=5 finalizer logic from transcribe.py only once per
-      utterance (expensive, but rare).
+NOT CONFIRMED: docs/STREAMING_CONTRACT.md never mentions a
+`draft_reset` function. Your earlier failure ("draft_reset import
+issue") means solution/stream_server.py imports it - that file is
+visible locally in your repo right now (it only gets swapped for the
+official copy at scoring time). If you want to close this last gap,
+run:
+    findstr /i "draft_reset" solution\\stream_server.py
+and paste me the line - it'll show the exact call signature. Built
+defensively below (accepts any args/kwargs) so it should work either
+way, but confirming it removes the one remaining guess in this file.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, List, Tuple
 
 import numpy as np
 
@@ -82,154 +72,151 @@ from solution.transcribe import (
     _dedupe_repetition,
 )
 
-SAMPLE_RATE_DEFAULT = 16000
-PARTIAL_INTERVAL_S = 0.5   # how often to re-run the cheap partial pass
-MIN_AUDIO_FOR_PARTIAL_S = 0.3  # don't bother transcribing tiny buffers
+SAMPLE_RATE = 16000
+TAIL_WINDOW_MAX_S = 8.0          # safety cap on tail re-decode length
+COMMIT_SAFETY_WORDS = 2          # never commit the trailing N words of a pass
+MIN_NEW_AUDIO_S = 0.4            # throttle: need this much new audio to re-run
+MIN_WALL_INTERVAL_S = 0.35       # throttle: don't re-run more often than this
 
 
 class _StreamState:
     def __init__(self) -> None:
-        self.pcm_f32 = np.zeros(0, dtype=np.float32)
-        self.sample_rate = SAMPLE_RATE_DEFAULT
-        self.committed_text = ""
-        self.last_partial_words: list[str] = []
-        self.last_partial_time = 0.0
-        self.finalized = False
+        self.committed_text: str = ""
+        self.committed_samples: int = 0       # audio cursor for the tail window
+        self.prev_tail_words: List[str] = []  # for the 2-pass stability check
+        self.last_run_wall: float = 0.0
+        self.finalized: bool = False
 
 
 _state = _StreamState()
 
 
 def draft_reset(*_args: Any, **_kwargs: Any) -> None:
-    """Reset all per-stream state. Called by the harness at the start of
-    each new clip/session. Accepts/ignores any args defensively in case
-    the harness passes something (e.g. a session id) we don't need."""
+    """Reset all per-stream state. Signature not confirmed against the
+    real solution/stream_server.py - see module docstring. Accepts and
+    ignores any args/kwargs defensively."""
     global _state
     _state = _StreamState()
     return None
 
 
-def _to_float32(audio_chunk: Any) -> np.ndarray:
-    """Normalize whatever audio representation we're handed into a 1-D
-    float32 numpy array in [-1, 1]."""
-    if isinstance(audio_chunk, (bytes, bytearray)):
-        arr = np.frombuffer(bytes(audio_chunk), dtype=np.int16)
-        return arr.astype(np.float32) / 32768.0
-    arr = np.asarray(audio_chunk)
-    if arr.dtype == np.int16:
-        return arr.astype(np.float32) / 32768.0
-    return arr.astype(np.float32)
+def _bytes_to_f32(buf: bytes) -> np.ndarray:
+    arr = np.frombuffer(bytes(buf), dtype=np.int16)
+    return arr.astype(np.float32) / 32768.0
 
 
-def _commit_stable_prefix(new_words: list[str]) -> None:
-    """Compare the new partial's words against the previous partial's
-    words; whatever matches at the start is considered stable and gets
-    committed, so it won't be rewritten again (avoids the 'committed
-    text gets rewritten' latency-score penalty)."""
-    old_words = _state.last_partial_words
-    stable_len = 0
-    for a, b in zip(old_words, new_words):
-        if a != b:
-            break
-        stable_len += 1
-    # Leave the last couple of words uncommitted even if they matched -
-    # they're the most likely to change as more audio arrives.
-    safe_len = max(0, stable_len - 2)
-    if safe_len > 0:
-        newly_committed = " ".join(new_words[:safe_len])
-        if newly_committed and not _state.committed_text.startswith(newly_committed):
-            _state.committed_text = newly_committed
-    _state.last_partial_words = new_words
-
-
-def _run_partial(audio: np.ndarray, sample_rate: int) -> str:
+def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]]]:
+    """Cheap pass over just the uncommitted tail. Returns the text and,
+    if available, (word, end_time_within_tail) pairs used to advance the
+    audio cursor precisely at a word boundary."""
     model = _get_model(FAST_MODEL_NAME)
     segments, _info = model.transcribe(
-        audio,
+        tail_audio,
         task="transcribe",
-        beam_size=1,               # cheap - this runs frequently
+        beam_size=1,                       # cheap - runs frequently
         vad_filter=True,
         condition_on_previous_text=False,
+        word_timestamps=True,
     )
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    segments = list(segments)
+    text = " ".join(s.text.strip() for s in segments).strip()
+    words: List[Tuple[str, float]] = []
+    for seg in segments:
+        for w in (getattr(seg, "words", None) or []):
+            words.append((w.word.strip(), w.end))
+    return text, words
 
 
-def _run_final(audio: np.ndarray, sample_rate: int) -> str:
-    """Same faithful logic as transcribe.py's auto mode: fast pass,
-    escalate to the Hindi-capable model if it looks code-switched,
-    romanize Devanagari, guard against repetition loops."""
+def _run_final(full_audio: np.ndarray) -> str:
+    """Full-buffer, full-quality pass - same faithful logic as
+    transcribe.py's auto mode. This is where the 60 quality points live,
+    so it gets the full latency budget, not the cheap partial pass."""
     fast_model = _get_model(FAST_MODEL_NAME)
     segments, info = fast_model.transcribe(
-        audio, task="transcribe", beam_size=5,
+        full_audio, task="transcribe", beam_size=5,
         vad_filter=True, condition_on_previous_text=False,
     )
-    fast_text = " ".join(seg.text.strip() for seg in segments).strip()
+    fast_text = " ".join(s.text.strip() for s in segments).strip()
 
     if _looks_code_switched(fast_text, getattr(info, "language", None),
                              getattr(info, "language_probability", None)):
         strong_model = _get_model(HINGLISH_MODEL_NAME)
         segments2, _info2 = strong_model.transcribe(
-            audio, task="transcribe", beam_size=5,
+            full_audio, task="transcribe", beam_size=5,
             vad_filter=True, condition_on_previous_text=False,
         )
-        text = " ".join(seg.text.strip() for seg in segments2).strip()
+        text = " ".join(s.text.strip() for s in segments2).strip()
     else:
         text = fast_text
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)
 
-    text = _romanize(text)
-    return text.strip()
+    return _romanize(text).strip()
 
 
-def draft(
-    audio_chunk: Any,
-    sample_rate: int = SAMPLE_RATE_DEFAULT,
-    is_final: bool = False,
-    **_kwargs: Any,
-) -> Dict[str, str]:
-    """Called repeatedly as audio arrives. See module docstring for the
-    return schema. Defensive **_kwargs absorbs any extra fields the
-    harness might pass that we don't know about yet."""
-    _state.sample_rate = sample_rate
-    chunk_f32 = _to_float32(audio_chunk)
-    _state.pcm_f32 = np.concatenate([_state.pcm_f32, chunk_f32])
-
-    duration_s = len(_state.pcm_f32) / float(sample_rate)
-    now = time.perf_counter()
+def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
+    """See module docstring for the contract. Returns (text_so_far,
+    stable_chars)."""
+    global _state
+    full_audio = _bytes_to_f32(audio_buffer)
 
     if is_final:
-        final_text = _run_final(_state.pcm_f32, sample_rate)
+        final_text = _run_final(full_audio)
         _state.committed_text = final_text
         _state.finalized = True
-        return {
-            "text": final_text,
-            "committed": final_text,
-            "partial": "",
-        }
+        return final_text, len(final_text)
 
-    should_run_partial = (
-        duration_s >= MIN_AUDIO_FOR_PARTIAL_S
-        and (now - _state.last_partial_time) >= PARTIAL_INTERVAL_S
-    )
-    if should_run_partial:
-        _state.last_partial_time = now
-        partial_text = _run_partial(_state.pcm_f32, sample_rate)
-        words = partial_text.split()
-        _commit_stable_prefix(words)
-        full_text = partial_text
-        trailing = full_text[len(_state.committed_text):].strip()
-        return {
-            "text": full_text,
-            "committed": _state.committed_text,
-            "partial": trailing,
-        }
+    total_samples = len(full_audio)
+    new_samples = total_samples - _state.committed_samples
+    now = time.perf_counter()
 
-    # Not time for a new partial pass yet - return what we have.
-    trailing = " ".join(_state.last_partial_words)[len(_state.committed_text):].strip()
-    return {
-        "text": (_state.committed_text + " " + trailing).strip(),
-        "committed": _state.committed_text,
-        "partial": trailing,
-    }
+    # Throttle: not enough new audio, or too soon since the last pass -
+    # return the unchanged committed state (cheap, and can't cause churn
+    # since nothing changes).
+    if (new_samples / SAMPLE_RATE) < MIN_NEW_AUDIO_S or \
+       (now - _state.last_run_wall) < MIN_WALL_INTERVAL_S:
+        return _state.committed_text, len(_state.committed_text)
+
+    _state.last_run_wall = now
+    tail_start = _state.committed_samples
+    tail_audio = full_audio[tail_start:]
+
+    max_tail_samples = int(TAIL_WINDOW_MAX_S * SAMPLE_RATE)
+    if len(tail_audio) > max_tail_samples:
+        # Safety fallback only - shouldn't normally trigger if commits
+        # are progressing at a reasonable rate.
+        tail_audio = tail_audio[-max_tail_samples:]
+
+    tail_text, tail_words = _run_tail_partial(tail_audio)
+    new_words = tail_text.split()
+
+    # 2-pass stability: only trust a word if it also appeared at the same
+    # position in the immediately preceding tail pass.
+    stable_word_count = 0
+    for a, b in zip(_state.prev_tail_words, new_words):
+        if a != b:
+            break
+        stable_word_count += 1
+    commit_word_count = max(0, stable_word_count - COMMIT_SAFETY_WORDS)
+
+    if commit_word_count > 0:
+        addition = " ".join(new_words[:commit_word_count])
+        _state.committed_text = (
+            f"{_state.committed_text} {addition}".strip()
+            if _state.committed_text else addition
+        )
+        if len(tail_words) >= commit_word_count:
+            end_time_in_tail = tail_words[commit_word_count - 1][1]
+            _state.committed_samples = tail_start + int(end_time_in_tail * SAMPLE_RATE)
+        else:
+            # No word timestamps available - fall back to a proportional
+            # estimate of where in the audio that many words likely ended.
+            frac = commit_word_count / max(1, len(new_words))
+            _state.committed_samples = tail_start + int(frac * len(tail_audio))
+
+    _state.prev_tail_words = new_words
+
+    trailing = " ".join(new_words[commit_word_count:]) if commit_word_count else tail_text
+    text_so_far = f"{_state.committed_text} {trailing}".strip()
+    return text_so_far, len(_state.committed_text)
