@@ -1,0 +1,9 @@
+# solution/draft.py only needs numpy beyond what's already in
+# requirements.txt (faster-whisper, indic-transliteration). This file
+# exists so `pip install -r requirements.txt -r requirements-streaming.txt`
+# (as documented in GETTING_STARTED.md) doesn't fail on a missing file.
+#
+# If docs/STREAMING_CONTRACT.md turns out to require something else
+# (e.g. a specific audio I/O library the sealed harness expects on the
+# other side of the interface), add it here.
+numpy>=1.24

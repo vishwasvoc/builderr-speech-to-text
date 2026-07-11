@@ -1,0 +1,23 @@
+# Core local ASR engine — MIT licensed wrapper around CTranslate2,
+# runs OpenAI Whisper weights (Whisper weights themselves are MIT licensed).
+# Fully local / offline once the model files are downloaded once.
+# Also serves as the fallback backend on non-Apple machines (e.g. your
+# Windows dev box) and as a safety-net fallback if mlx-whisper fails.
+faster-whisper==1.0.3
+
+# GPU/ANE-accelerated ASR backend on Apple Silicon (MIT licensed, Apple).
+# The scoring machine is a MacBook Pro M1 Pro, and docs/STREAMING_CONTRACT.md
+# confirms the on-device accelerator is available to the scored process -
+# faster-whisper alone can't use it (CTranslate2 is CPU-only on Apple
+# hardware), which is the most likely cause of the "too slow" feedback.
+# The environment marker means this is skipped cleanly on Windows/Linux,
+# where it isn't installable anyway - local dev keeps using faster-whisper.
+mlx-whisper; sys_platform == "darwin"
+
+# Pure-Python Devanagari <-> Roman transliteration (MIT licensed).
+# Used to keep Hindi words that were spoken, but rendered in Roman script,
+# instead of silently translating them into English.
+indic-transliteration==2.3.55
+
+# Numeric/text helpers
+numpy>=1.24
