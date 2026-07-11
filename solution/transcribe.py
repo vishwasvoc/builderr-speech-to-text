@@ -37,13 +37,40 @@ Design (why it's built this way):
          the user), instead of translating them - so "yeh file update kar
          do" stays "yeh file update kar do", not "update this file".
 
+INFERENCE BACKEND (updated after real scoring feedback: "too slow"):
+    docs/STREAMING_CONTRACT.md confirms the scoring Mac's "on-device
+    accelerator (GPU / Apple Neural Engine) is available to the scored
+    process." faster-whisper's CTranslate2 backend does NOT use Apple's
+    GPU/ANE - it's CPU-only there, which is almost certainly why the first
+    submission scored "too slow". This module now prefers mlx-whisper
+    (Apple's MLX framework - genuinely GPU/ANE-accelerated on Apple
+    Silicon) when it's importable, and falls back to faster-whisper on
+    CPU otherwise (e.g. on your Windows dev machine, where mlx isn't
+    available - so local testing keeps working exactly as before).
+
+    CAVEAT: I can't run or benchmark this on a real Mac. The mlx-whisper
+    API and exact mlx-community model repo names are taken from public
+    docs/examples, not verified against the actual scoring box. The code
+    below tries a couple of plausible repo-name variants and falls back
+    to faster-whisper on any failure, so a wrong guess should degrade to
+    "as before", not crash - but if you can get real logs/timing off a
+    Mac (even a friend's), that would let us confirm this is actually
+    faster rather than just theoretically faster.
+
 Models used (declare licenses so the tool can ship for free):
-    - faster-whisper (MIT) running OpenAI Whisper checkpoints (MIT weights).
-    - indic-transliteration (MIT) for pure-Python Devanagari -> Roman script
-      conversion. No network calls, no cloud APIs, ever.
+    - mlx-whisper (MIT, Apple) + mlx-community Whisper checkpoints
+      (converted from OpenAI's MIT-licensed Whisper weights) - primary,
+      GPU/ANE-accelerated backend on Apple Silicon.
+    - faster-whisper (MIT) running OpenAI Whisper checkpoints (MIT
+      weights) - fallback backend (CPU-only, used on non-Apple machines
+      or if mlx-whisper fails to load).
+    - indic-transliteration (MIT) for pure-Python Devanagari -> Roman
+      script conversion. No network calls, no cloud APIs, ever.
 
 Everything below only touches local files / local model weights already
-cached on disk. No network calls are made inside this module.
+cached on disk. No network calls are made inside this module once models
+are warmed up (mirrors how faster-whisper needed one-time network to
+download weights before offline scoring).
 """
 
 from __future__ import annotations
@@ -57,16 +84,29 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
-# Lazy imports so `--help` works even before dependencies are installed.
+# Backend selection: prefer mlx-whisper (Apple GPU/ANE) if importable,
+# fall back to faster-whisper (CPU-only, works everywhere including your
+# Windows dev machine) otherwise.
 # ---------------------------------------------------------------------------
+_mlx_whisper = None
 _WhisperModel = None
 _sanscript = None
+_BACKEND: Optional[str] = None  # "mlx" or "faster_whisper", set on first use
 
 
 def _lazy_imports() -> None:
-    global _WhisperModel, _sanscript
-    if _WhisperModel is None:
+    global _mlx_whisper, _WhisperModel, _sanscript, _BACKEND
+    if _BACKEND is None:
+        try:
+            import mlx_whisper as _mw  # type: ignore
+            _mlx_whisper = _mw
+            _BACKEND = "mlx"
+        except Exception:
+            _BACKEND = "faster_whisper"
+    if _BACKEND == "faster_whisper" and _WhisperModel is None:
         from faster_whisper import WhisperModel  # type: ignore
         _WhisperModel = WhisperModel
     if _sanscript is None:
@@ -79,8 +119,18 @@ def _lazy_imports() -> None:
 # ---------------------------------------------------------------------------
 FAST_MODEL_NAME = os.environ.get("STT_FAST_MODEL", "base")
 HINGLISH_MODEL_NAME = os.environ.get("STT_HINGLISH_MODEL", "small")
-DEVICE = os.environ.get("STT_DEVICE", "cpu")
-COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")  # fast on plain CPUs
+DEVICE = os.environ.get("STT_DEVICE", "cpu")            # only used by faster-whisper fallback
+COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")  # only used by faster-whisper fallback
+
+# mlx-community repo name candidates per logical size. Naming on the Hub
+# is inconsistent (some have a "-mlx" suffix, some don't) and I couldn't
+# verify these against the real scoring Mac, so we try a few and cache
+# whichever one actually works.
+_MLX_REPO_CANDIDATES: Dict[str, List[str]] = {
+    "base": ["mlx-community/whisper-base-mlx", "mlx-community/whisper-base"],
+    "small": ["mlx-community/whisper-small-mlx", "mlx-community/whisper-small"],
+}
+_resolved_mlx_repo: Dict[str, str] = {}
 
 # If the fast pass thinks there's at least this much probability mass on a
 # non-English language (mainly Hindi), or the fast pass's own text contains
@@ -117,6 +167,7 @@ class EngineResult:
     language_probability: Optional[float]
     duration_ms: float
     engine_name: str
+    words: List[Tuple[str, float]] = field(default_factory=list)  # (word, end_time_s)
 
 
 # ---------------------------------------------------------------------------
@@ -126,31 +177,101 @@ _model_cache: Dict[str, Any] = {}
 
 
 def _get_model(name: str):
+    """Only used by the faster-whisper fallback path - mlx-whisper manages
+    its own model caching internally keyed by repo string."""
     _lazy_imports()
     if name not in _model_cache:
         _model_cache[name] = _WhisperModel(name, device=DEVICE, compute_type=COMPUTE_TYPE)
     return _model_cache[name]
 
 
-def _run_whisper(model_name: str, audio_path: str, engine_label: str) -> EngineResult:
-    model = _get_model(model_name)
+def _mlx_transcribe(size: str, audio: Any, beam_size: int, word_timestamps: bool) -> Dict[str, Any]:
+    candidates = [_resolved_mlx_repo[size]] if size in _resolved_mlx_repo else _MLX_REPO_CANDIDATES.get(size, [])
+    last_err: Optional[Exception] = None
+    for repo in candidates:
+        try:
+            kwargs: Dict[str, Any] = dict(
+                path_or_hf_repo=repo, task="transcribe", word_timestamps=word_timestamps,
+            )
+            try:
+                result = _mlx_whisper.transcribe(audio, beam_size=beam_size, **kwargs)
+            except TypeError:
+                # older/newer mlx-whisper may not accept beam_size - retry without it
+                result = _mlx_whisper.transcribe(audio, **kwargs)
+            _resolved_mlx_repo[size] = repo
+            return result
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"mlx-whisper: no working repo for size={size}: {last_err}")
+
+
+def _transcribe_core(
+    model_size: str,
+    audio: Any,               # file path (str) or float32 numpy array, mono 16kHz
+    beam_size: int = 5,
+    word_timestamps: bool = False,
+    engine_label: Optional[str] = None,
+) -> EngineResult:
+    """Backend-agnostic transcription used by both batch (this module) and
+    streaming (solution/draft.py) code paths, so both stay consistent and
+    neither needs to know which backend is actually running."""
+    _lazy_imports()
     t0 = time.perf_counter()
+    label = engine_label or f"{_BACKEND}-{model_size}"
+
+    if _BACKEND == "mlx":
+        try:
+            result = _mlx_transcribe(model_size, audio, beam_size, word_timestamps)
+            text = (result.get("text") or "").strip()
+            language = result.get("language")
+            words: List[Tuple[str, float]] = []
+            if word_timestamps:
+                for seg in result.get("segments", []) or []:
+                    for w in seg.get("words", []) or []:
+                        words.append((str(w.get("word", "")).strip(), float(w.get("end", 0.0))))
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            return EngineResult(text=text, language=language, language_probability=None,
+                                 duration_ms=dt_ms, engine_name=f"mlx-whisper-{model_size}", words=words)
+        except Exception:
+            # mlx failed for this call (bad repo name, runtime error, etc.) -
+            # fall back to faster-whisper on CPU rather than crash/blank out.
+            pass
+
+    # faster-whisper fallback (also the only path on non-Apple machines)
+    if _WhisperModel is None:
+        from faster_whisper import WhisperModel  # type: ignore
+        globals()["_WhisperModel"] = WhisperModel
+    model = _get_model(model_size)
     segments, info = model.transcribe(
-        audio_path,
-        task="transcribe",       # NEVER "translate" - that's how faithfulness gets lost
-        beam_size=5,
-        vad_filter=True,          # trims silence, helps latency and avoids blank loops
-        condition_on_previous_text=False,  # reduces repetition-loop risk
+        audio,
+        task="transcribe",
+        beam_size=beam_size,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        word_timestamps=word_timestamps,
     )
+    segments = list(segments)
     text = " ".join(seg.text.strip() for seg in segments).strip()
+    words = []
+    if word_timestamps:
+        for seg in segments:
+            for w in (getattr(seg, "words", None) or []):
+                words.append((w.word.strip(), w.end))
     dt_ms = (time.perf_counter() - t0) * 1000.0
     return EngineResult(
         text=text,
         language=getattr(info, "language", None),
         language_probability=getattr(info, "language_probability", None),
         duration_ms=dt_ms,
-        engine_name=engine_label,
+        engine_name=f"faster-whisper-{model_size}",
+        words=words,
     )
+
+
+def _run_whisper(model_name: str, audio_path: str, engine_label: str) -> EngineResult:
+    return _transcribe_core(model_name, audio_path, beam_size=5, word_timestamps=False,
+                             engine_label=engine_label)
 
 
 # ---------------------------------------------------------------------------

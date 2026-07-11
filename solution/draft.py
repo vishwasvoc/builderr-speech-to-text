@@ -43,6 +43,15 @@ Two behaviors follow from that:
    exact same logic solution/transcribe.py uses in "auto" mode, reused
    directly so both paths agree.
 
+UPDATED after real scoring feedback ("too slow", "misses too much"):
+both _run_tail_partial and _run_final now go through
+solution.transcribe._transcribe_core, which prefers mlx-whisper
+(genuinely GPU/ANE-accelerated on the scoring Mac) over faster-whisper
+(CPU-only there) - see transcribe.py's docstring for the full reasoning
+and the caveat that this is unverified on real Mac hardware. _run_final
+also now retries once with the other model size if the primary pass
+comes back blank, since a blank final is a severe hard cap.
+
 NOT CONFIRMED: docs/STREAMING_CONTRACT.md never mentions a
 `draft_reset` function. Your earlier failure ("draft_reset import
 issue") means solution/stream_server.py imports it - that file is
@@ -65,7 +74,7 @@ import numpy as np
 from solution.transcribe import (
     FAST_MODEL_NAME,
     HINGLISH_MODEL_NAME,
-    _get_model,
+    _transcribe_core,
     _looks_code_switched,
     _romanize,
     _detect_repetition_loop,
@@ -108,46 +117,32 @@ def _bytes_to_f32(buf: bytes) -> np.ndarray:
 def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]]]:
     """Cheap pass over just the uncommitted tail. Returns the text and,
     if available, (word, end_time_within_tail) pairs used to advance the
-    audio cursor precisely at a word boundary."""
-    model = _get_model(FAST_MODEL_NAME)
-    segments, _info = model.transcribe(
-        tail_audio,
-        task="transcribe",
-        beam_size=1,                       # cheap - runs frequently
-        vad_filter=True,
-        condition_on_previous_text=False,
-        word_timestamps=True,
-    )
-    segments = list(segments)
-    text = " ".join(s.text.strip() for s in segments).strip()
-    words: List[Tuple[str, float]] = []
-    for seg in segments:
-        for w in (getattr(seg, "words", None) or []):
-            words.append((w.word.strip(), w.end))
-    return text, words
+    audio cursor precisely at a word boundary. Uses whichever backend
+    solution/transcribe.py resolved (mlx on the scoring Mac, faster-whisper
+    elsewhere) - see that module for why."""
+    result = _transcribe_core(FAST_MODEL_NAME, tail_audio, beam_size=1, word_timestamps=True)
+    return result.text, result.words
 
 
 def _run_final(full_audio: np.ndarray) -> str:
     """Full-buffer, full-quality pass - same faithful logic as
     transcribe.py's auto mode. This is where the 60 quality points live,
-    so it gets the full latency budget, not the cheap partial pass."""
-    fast_model = _get_model(FAST_MODEL_NAME)
-    segments, info = fast_model.transcribe(
-        full_audio, task="transcribe", beam_size=5,
-        vad_filter=True, condition_on_previous_text=False,
-    )
-    fast_text = " ".join(s.text.strip() for s in segments).strip()
+    so it gets the full latency budget, not the cheap partial pass.
+    Includes a blank-safety retry: a blank final is a severe hard cap
+    (docs/STREAMING_CONTRACT.md 3.4), so if the primary backend somehow
+    returns nothing, we retry once before giving up."""
+    fast = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
 
-    if _looks_code_switched(fast_text, getattr(info, "language", None),
-                             getattr(info, "language_probability", None)):
-        strong_model = _get_model(HINGLISH_MODEL_NAME)
-        segments2, _info2 = strong_model.transcribe(
-            full_audio, task="transcribe", beam_size=5,
-            vad_filter=True, condition_on_previous_text=False,
-        )
-        text = " ".join(s.text.strip() for s in segments2).strip()
+    if _looks_code_switched(fast.text, fast.language, fast.language_probability):
+        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
+        text = strong.text
     else:
-        text = fast_text
+        text = fast.text
+
+    if not text.strip():
+        # Blank-safety retry: try the other model size once before giving up.
+        retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
+        text = retry.text
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)
