@@ -52,22 +52,32 @@ and the caveat that this is unverified on real Mac hardware. _run_final
 also now retries once with the other model size if the primary pass
 comes back blank, since a blank final is a severe hard cap.
 
-NOT CONFIRMED: docs/STREAMING_CONTRACT.md never mentions a
-`draft_reset` function. Your earlier failure ("draft_reset import
-issue") means solution/stream_server.py imports it - that file is
-visible locally in your repo right now (it only gets swapped for the
-official copy at scoring time). If you want to close this last gap,
-run:
-    findstr /i "draft_reset" solution\\stream_server.py
-and paste me the line - it'll show the exact call signature. Built
-defensively below (accepts any args/kwargs) so it should work either
-way, but confirming it removes the one remaining guess in this file.
+UPDATED again after leaderboard feedback ("only the English clips
+finished reliably", score 15/100 vs RambleFix's 68.52): this points at
+a specific, high-confidence bug, not just "model quality is weaker."
+docs/STREAMING_CONTRACT.md's flow is: launch the server -> warm up on
+ONE unscored clip -> call block_network() -> score. If that single
+warmup clip is plain English (likely, since even RambleFix's own draft
+path is English-biased), HINGLISH_MODEL_NAME never gets touched during
+warmup under the old lazy-loading design - so the FIRST time it's ever
+needed is the first real Hindi/code-switched clip in the scored,
+network-blocked run, where trying to load/download it for the first
+time either hangs or throws. That's a near-exact match for "only
+English clips finished reliably" (English never needed the second
+model; every Hindi clip hit a cold, blocked load and scored ~0).
+
+Fix: _eager_warmup() below forces BOTH models to load at import time -
+i.e. while the harness is starting the server process, well before its
+own warmup clip and well before block_network() gets called. Matches
+how RambleFix's own draft server explicitly "downloads ggml-small the
+first time" as part of starting up, not during a scored clip.
 """
 
 from __future__ import annotations
 
+import os
 import time
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -88,6 +98,25 @@ MIN_NEW_AUDIO_S = 0.4            # throttle: need this much new audio to re-run
 MIN_WALL_INTERVAL_S = 0.35       # throttle: don't re-run more often than this
 
 
+def _eager_warmup() -> None:
+    """Force-load BOTH the fast and Hindi-capable models right now, at
+    import time, instead of waiting for each to be needed lazily. See
+    the module docstring for why this matters - it's the most likely
+    fix for clips failing outright rather than just scoring low.
+    Best-effort: swallow all exceptions so a warmup problem can't break
+    the import / stop the server printing READY at all. A slow or
+    partially-failed warmup is far better than the server never starting."""
+    try:
+        silence = np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.float32)
+        _transcribe_core(FAST_MODEL_NAME, silence, beam_size=1, word_timestamps=False)
+        _transcribe_core(HINGLISH_MODEL_NAME, silence, beam_size=1, word_timestamps=False)
+    except Exception:
+        pass
+
+
+_eager_warmup()
+
+
 class _StreamState:
     def __init__(self) -> None:
         self.committed_text: str = ""
@@ -95,15 +124,28 @@ class _StreamState:
         self.prev_tail_words: List[str] = []  # for the 2-pass stability check
         self.last_run_wall: float = 0.0
         self.finalized: bool = False
+        self.likely_code_switched: bool = False  # set True by any partial pass
+                                                   # that looked Hindi/mixed -
+                                                   # lets the final pass skip a
+                                                   # redundant "is this Hindi?"
+                                                   # check it already knows the
+                                                   # answer to (see _run_final)
 
 
 _state = _StreamState()
 
 
 def draft_reset(*_args: Any, **_kwargs: Any) -> None:
-    """Reset all per-stream state. Signature not confirmed against the
-    real solution/stream_server.py - see module docstring. Accepts and
-    ignores any args/kwargs defensively."""
+    """Reset all per-stream state. Called by the harness at the start of
+    each new clip/session (exact signature not confirmed -
+    docs/STREAMING_CONTRACT.md never mentions this function; we only
+    know it's imported because of the original "draft_reset import
+    issue" failure. solution/stream_server.py is visible locally in your
+    repo right now even though it's swapped for the official copy at
+    scoring time - `findstr /i "draft_reset" solution\\stream_server.py`
+    would show the real call if you want to close this last gap. Built
+    defensively below (accepts any args/kwargs) so it should work
+    either way."""
     global _state
     _state = _StreamState()
     return None
@@ -114,35 +156,59 @@ def _bytes_to_f32(buf: bytes) -> np.ndarray:
     return arr.astype(np.float32) / 32768.0
 
 
-def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]]]:
-    """Cheap pass over just the uncommitted tail. Returns the text and,
-    if available, (word, end_time_within_tail) pairs used to advance the
-    audio cursor precisely at a word boundary. Uses whichever backend
-    solution/transcribe.py resolved (mlx on the scoring Mac, faster-whisper
-    elsewhere) - see that module for why."""
+
+# Beam size for the FINAL pass only (partials always use beam_size=1 -
+# cheap, run frequently). Lower = faster but slightly less accurate.
+# Tunable without touching code, e.g. if latency is still too high:
+#   set STT_FINAL_BEAM_SIZE=2
+# Default lowered from 5 to 3 after "too slow" feedback - a reasonable
+# middle ground, but genuinely a guess without being able to benchmark
+# on the real scoring Mac. Turn it down further if still too slow, or
+# back up toward 5 if speed turns out fine and quality is the bottleneck.
+FINAL_BEAM_SIZE = int(os.environ.get("STT_FINAL_BEAM_SIZE", "3"))
+
+
+def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]], Optional[str], Optional[float]]:
+    """Cheap pass over just the uncommitted tail. Returns the text,
+    (word, end_time_within_tail) pairs for advancing the audio cursor,
+    and the detected language/confidence - the caller uses the latter to
+    flag likely_code_switched, so the final pass can skip re-checking
+    something it already knows (see _run_final)."""
     result = _transcribe_core(FAST_MODEL_NAME, tail_audio, beam_size=1, word_timestamps=True)
-    return result.text, result.words
+    return result.text, result.words, result.language, result.language_probability
 
 
-def _run_final(full_audio: np.ndarray) -> str:
+def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     """Full-buffer, full-quality pass - same faithful logic as
     transcribe.py's auto mode. This is where the 60 quality points live,
     so it gets the full latency budget, not the cheap partial pass.
+
+    Speed optimization: if partial passes already flagged this clip as
+    likely code-switched (hint_code_switched=True), skip straight to the
+    Hindi-capable model instead of first running a full fast-model pass
+    just to re-discover what we already know - saves one whole inference
+    pass on exactly the clips that are otherwise slowest/highest-risk.
+
     Includes a blank-safety retry: a blank final is a severe hard cap
     (docs/STREAMING_CONTRACT.md 3.4), so if the primary backend somehow
     returns nothing, we retry once before giving up."""
-    fast = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
-
-    if _looks_code_switched(fast.text, fast.language, fast.language_probability):
-        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
+    if hint_code_switched:
+        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
         text = strong.text
+        if not text.strip():
+            fallback = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+            text = fallback.text
     else:
-        text = fast.text
-
-    if not text.strip():
-        # Blank-safety retry: try the other model size once before giving up.
-        retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=5, word_timestamps=False)
-        text = retry.text
+        fast = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+        if _looks_code_switched(fast.text, fast.language, fast.language_probability):
+            strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+            text = strong.text
+        else:
+            text = fast.text
+        if not text.strip():
+            # Blank-safety retry: try the other model size once before giving up.
+            retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+            text = retry.text
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)
@@ -157,7 +223,7 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
     full_audio = _bytes_to_f32(audio_buffer)
 
     if is_final:
-        final_text = _run_final(full_audio)
+        final_text = _run_final(full_audio, hint_code_switched=_state.likely_code_switched)
         _state.committed_text = final_text
         _state.finalized = True
         return final_text, len(final_text)
@@ -183,7 +249,9 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
         # are progressing at a reasonable rate.
         tail_audio = tail_audio[-max_tail_samples:]
 
-    tail_text, tail_words = _run_tail_partial(tail_audio)
+    tail_text, tail_words, tail_lang, tail_lang_prob = _run_tail_partial(tail_audio)
+    if _looks_code_switched(tail_text, tail_lang, tail_lang_prob):
+        _state.likely_code_switched = True
     new_words = tail_text.split()
 
     # 2-pass stability: only trust a word if it also appeared at the same
