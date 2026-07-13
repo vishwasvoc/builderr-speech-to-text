@@ -185,7 +185,8 @@ def _get_model(name: str):
     return _model_cache[name]
 
 
-def _mlx_transcribe(size: str, audio: Any, beam_size: int, word_timestamps: bool) -> Dict[str, Any]:
+def _mlx_transcribe(size: str, audio: Any, beam_size: int, word_timestamps: bool,
+                     lenient: bool = False) -> Dict[str, Any]:
     candidates = [_resolved_mlx_repo[size]] if size in _resolved_mlx_repo else _MLX_REPO_CANDIDATES.get(size, [])
     last_err: Optional[Exception] = None
     for repo in candidates:
@@ -193,11 +194,30 @@ def _mlx_transcribe(size: str, audio: Any, beam_size: int, word_timestamps: bool
             kwargs: Dict[str, Any] = dict(
                 path_or_hf_repo=repo, task="transcribe", word_timestamps=word_timestamps,
             )
+            extra: Dict[str, Any] = {"beam_size": beam_size}
+            if lenient:
+                # Aimed at "dropped too much" feedback on Hindi/code-switch
+                # clips: openai-whisper-style decoding can silently discard
+                # a segment it's not confident about (treating accented or
+                # rapidly-code-switched speech as "no speech" or low
+                # quality). These names mirror openai-whisper's own
+                # transcribe() signature, which mlx-whisper is a port of -
+                # NOT verified against the installed mlx-whisper version,
+                # so this is wrapped in the same defensive TypeError-retry
+                # pattern as beam_size below.
+                extra["no_speech_threshold"] = 0.3     # default ~0.6 - less eager to call it silence
+                extra["logprob_threshold"] = -2.0        # default ~-1.0 - less eager to discard low-confidence text
+                extra["condition_on_previous_text"] = False
             try:
-                result = _mlx_whisper.transcribe(audio, beam_size=beam_size, **kwargs)
+                result = _mlx_whisper.transcribe(audio, **extra, **kwargs)
             except TypeError:
-                # older/newer mlx-whisper may not accept beam_size - retry without it
-                result = _mlx_whisper.transcribe(audio, **kwargs)
+                # Some combination of the above isn't supported by this
+                # mlx-whisper version - fall back to just beam_size, then
+                # to nothing extra at all, rather than fail the whole call.
+                try:
+                    result = _mlx_whisper.transcribe(audio, beam_size=beam_size, **kwargs)
+                except TypeError:
+                    result = _mlx_whisper.transcribe(audio, **kwargs)
             _resolved_mlx_repo[size] = repo
             return result
         except Exception as e:
@@ -212,6 +232,7 @@ def _transcribe_core(
     beam_size: int = 5,
     word_timestamps: bool = False,
     engine_label: Optional[str] = None,
+    lenient: bool = False,    # True for the Hindi/code-switch pass - see _mlx_transcribe
 ) -> EngineResult:
     """Backend-agnostic transcription used by both batch (this module) and
     streaming (solution/draft.py) code paths, so both stay consistent and
@@ -222,7 +243,7 @@ def _transcribe_core(
 
     if _BACKEND == "mlx":
         try:
-            result = _mlx_transcribe(model_size, audio, beam_size, word_timestamps)
+            result = _mlx_transcribe(model_size, audio, beam_size, word_timestamps, lenient=lenient)
             text = (result.get("text") or "").strip()
             language = result.get("language")
             words: List[Tuple[str, float]] = []
@@ -243,6 +264,15 @@ def _transcribe_core(
         from faster_whisper import WhisperModel  # type: ignore
         globals()["_WhisperModel"] = WhisperModel
     model = _get_model(model_size)
+    extra_kwargs: Dict[str, Any] = {}
+    if lenient:
+        # Same intent as the mlx branch above: reduce content-dropping on
+        # the harder Hindi/code-switch pass. These ARE the real, documented
+        # faster-whisper parameter names (unlike the mlx ones above, which
+        # are inferred) - this half is on solid ground.
+        extra_kwargs["no_speech_threshold"] = 0.3
+        extra_kwargs["log_prob_threshold"] = -2.0
+        extra_kwargs["vad_parameters"] = {"min_silence_duration_ms": 1000}
     segments, info = model.transcribe(
         audio,
         task="transcribe",
@@ -250,6 +280,7 @@ def _transcribe_core(
         vad_filter=True,
         condition_on_previous_text=False,
         word_timestamps=word_timestamps,
+        **extra_kwargs,
     )
     segments = list(segments)
     text = " ".join(seg.text.strip() for seg in segments).strip()
@@ -269,9 +300,9 @@ def _transcribe_core(
     )
 
 
-def _run_whisper(model_name: str, audio_path: str, engine_label: str) -> EngineResult:
+def _run_whisper(model_name: str, audio_path: str, engine_label: str, lenient: bool = False) -> EngineResult:
     return _transcribe_core(model_name, audio_path, beam_size=5, word_timestamps=False,
-                             engine_label=engine_label)
+                             engine_label=engine_label, lenient=lenient)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +425,7 @@ def transcribe(
 
     elif mode in ("hinglish", "verbatim"):
         strong = _run_whisper(
-            HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}"
+            HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
         )
         raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
         model_ids.append(f"faster-whisper-{HINGLISH_MODEL_NAME}")
@@ -411,7 +442,7 @@ def transcribe(
 
         if _looks_code_switched(fast.text, fast.language, fast.language_probability):
             strong = _run_whisper(
-                HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}"
+                HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
             )
             raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
             model_ids.append(f"faster-whisper-{HINGLISH_MODEL_NAME}")

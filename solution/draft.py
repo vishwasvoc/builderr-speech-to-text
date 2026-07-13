@@ -167,6 +167,15 @@ def _bytes_to_f32(buf: bytes) -> np.ndarray:
 # back up toward 5 if speed turns out fine and quality is the bottleneck.
 FINAL_BEAM_SIZE = int(os.environ.get("STT_FINAL_BEAM_SIZE", "3"))
 
+# Separate, higher beam size for the Hindi/code-switch pass specifically.
+# After "English got stronger, mixed Hindi-English still dropped too
+# much" feedback: the across-the-board beam_size cut above likely helped
+# the easy English path but hurt the hard Hindi path, which is exactly
+# where completeness matters most (40+20 = 60 of 100 points). This pass
+# also runs with lenient=True (see transcribe.py) to reduce content
+# being silently dropped as "low confidence" or "no speech".
+HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "5"))
+
 
 def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]], Optional[str], Optional[float]]:
     """Cheap pass over just the uncommitted tail. Returns the text,
@@ -193,7 +202,8 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     (docs/STREAMING_CONTRACT.md 3.4), so if the primary backend somehow
     returns nothing, we retry once before giving up."""
     if hint_code_switched:
-        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
+                                   word_timestamps=False, lenient=True)
         text = strong.text
         if not text.strip():
             fallback = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
@@ -201,13 +211,15 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     else:
         fast = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
         if _looks_code_switched(fast.text, fast.language, fast.language_probability):
-            strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+            strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
+                                       word_timestamps=False, lenient=True)
             text = strong.text
         else:
             text = fast.text
         if not text.strip():
             # Blank-safety retry: try the other model size once before giving up.
-            retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
+            retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
+                                      word_timestamps=False, lenient=True)
             text = retry.text
 
     if _detect_repetition_loop(text):
