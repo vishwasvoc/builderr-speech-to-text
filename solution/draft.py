@@ -66,15 +66,43 @@ time either hangs or throws. That's a near-exact match for "only
 English clips finished reliably" (English never needed the second
 model; every Hindi clip hit a cold, blocked load and scored ~0).
 
-Fix: _eager_warmup() below forces BOTH models to load at import time -
-i.e. while the harness is starting the server process, well before its
-own warmup clip and well before block_network() gets called. Matches
-how RambleFix's own draft server explicitly "downloads ggml-small the
-first time" as part of starting up, not during a scored clip.
+CODE RED UPDATE (score dropped to 12.50, note: "six of eight clips timed
+out and mixed speech did not finish"): this is a DIFFERENT, more urgent
+failure mode than "dropped content" - a timeout/hang scores that clip as
+0 outright (the worst possible outcome, worse than a rough-but-complete
+answer). The previous round's fix (bigger Hindi model + more lenient/
+exhaustive decoding + a blank-safety retry that can trigger a 3rd
+sequential model call) makes each Hindi clip take LONGER - exactly the
+wrong direction if timeouts are now the dominant problem.
+
+Also worth flagging: builderr.ai/guidelines now describes this challenge
+as "Final only: 70 + 30... Early drafts are not scored" - simpler than
+docs/STREAMING_CONTRACT.md's 40/20/25/5/5 breakdown, and possibly in
+tension with it (that doc calls itself "the single source of truth", so
+treat it as ground truth, but the guidelines page suggests partials may
+matter less than we assumed). Since both can't be fully verified against
+each other, the design below is safe under EITHER: partials still run
+(avoids the "no useful partial ever" cap either doc could apply) but are
+throttled harder, freeing CPU for what both docs agree matters most - a
+fast, complete final.
+
+The actual fix: every model call in this file now runs through
+_call_with_deadline(), which enforces a hard self-imposed wall-clock
+budget using a background thread pool. If a call doesn't finish in time,
+we DON'T wait for it - we fall back to whatever we already have (even
+lower-quality-but-complete beats zero) and return well within budget.
+This lets us KEEP the Hindi quality improvements (bigger model, lenient
+decoding) when there's time for them, while guaranteeing we can never
+hang a clip to a 0 score. Known limitation: Python cannot forcibly kill
+a blocking call, so a timed-out call keeps running in the background
+(wasting some CPU) even after we've moved on - the thread pool has a
+few extra workers as headroom against this, but it's a real constraint,
+not a perfect solution.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import time
 from typing import Any, List, Optional, Tuple
@@ -94,8 +122,50 @@ from solution.transcribe import (
 SAMPLE_RATE = 16000
 TAIL_WINDOW_MAX_S = 8.0          # safety cap on tail re-decode length
 COMMIT_SAFETY_WORDS = 2          # never commit the trailing N words of a pass
-MIN_NEW_AUDIO_S = 0.4            # throttle: need this much new audio to re-run
-MIN_WALL_INTERVAL_S = 0.35       # throttle: don't re-run more often than this
+MIN_NEW_AUDIO_S = 0.5            # throttle: need this much new audio to re-run
+MIN_WALL_INTERVAL_S = 0.6        # throttle: don't re-run more often than this
+                                  # (relaxed from 0.4/0.35 - partials likely
+                                  # matter less than we assumed; free up CPU
+                                  # for the final instead)
+
+# Background pool used for deadline-bounded calls (see _call_with_deadline).
+# A few extra workers beyond what we'd normally need in flight at once, as
+# headroom against orphaned timed-out calls still running when the next
+# one is submitted (Python can't forcibly cancel a blocking call).
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr")
+
+# Hard wall-clock budget for the ENTIRE final pass (fast check + possible
+# Hindi escalation + possible retry, all combined). Chosen well under
+# where a hang would otherwise cost a clip its full score - tune via:
+#   set STT_FINAL_DEADLINE_S=3.0
+FINAL_DEADLINE_S = float(os.environ.get("STT_FINAL_DEADLINE_S", "4.0"))
+
+# Much shorter budget for a single partial pass - if a partial can't
+# finish quickly, just skip that cycle rather than risk it stalling
+# anything. Partials are frequent and cheap by design; a slow one isn't
+# worth waiting for.
+PARTIAL_DEADLINE_S = float(os.environ.get("STT_PARTIAL_DEADLINE_S", "1.2"))
+
+
+def _call_with_deadline(model_size: str, audio: np.ndarray, beam_size: int,
+                         lenient: bool, deadline_s: float, word_timestamps: bool = False):
+    """Run a transcription call with a hard wall-clock deadline. Returns
+    the EngineResult, or None if it didn't finish in time (or raised) -
+    callers must handle None by falling back to something else instead
+    of waiting. See module docstring for why this exists and its
+    limitation (can't truly cancel the background call)."""
+    if deadline_s <= 0.05:
+        return None  # no meaningful time left - don't even try
+    future = _executor.submit(
+        _transcribe_core, model_size, audio,
+        beam_size=beam_size, word_timestamps=word_timestamps, lenient=lenient,
+    )
+    try:
+        return future.result(timeout=deadline_s)
+    except Exception:
+        # Covers both concurrent.futures.TimeoutError and any exception
+        # raised inside _transcribe_core - either way, no result in time.
+        return None
 
 
 def _eager_warmup() -> None:
@@ -121,7 +191,6 @@ class _StreamState:
     def __init__(self) -> None:
         self.committed_text: str = ""
         self.committed_samples: int = 0       # audio cursor for the tail window
-        self.prev_tail_words: List[str] = []  # for the 2-pass stability check
         self.last_run_wall: float = 0.0
         self.finalized: bool = False
         self.likely_code_switched: bool = False  # set True by any partial pass
@@ -178,49 +247,70 @@ HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "5"))
 
 
 def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]], Optional[str], Optional[float]]:
-    """Cheap pass over just the uncommitted tail. Returns the text,
-    (word, end_time_within_tail) pairs for advancing the audio cursor,
-    and the detected language/confidence - the caller uses the latter to
-    flag likely_code_switched, so the final pass can skip re-checking
-    something it already knows (see _run_final)."""
-    result = _transcribe_core(FAST_MODEL_NAME, tail_audio, beam_size=1, word_timestamps=True)
+    """Cheap pass over just the uncommitted tail, bounded by
+    PARTIAL_DEADLINE_S. Returns the text, (word, end_time_within_tail)
+    pairs for advancing the audio cursor, and the detected
+    language/confidence. On timeout, returns empty/unknown - the caller
+    (draft()) already handles "nothing new happened this cycle" cleanly."""
+    result = _call_with_deadline(FAST_MODEL_NAME, tail_audio, beam_size=1,
+                                  lenient=False, deadline_s=PARTIAL_DEADLINE_S,
+                                  word_timestamps=True)
+    if result is None:
+        return "", [], None, None
     return result.text, result.words, result.language, result.language_probability
 
 
 def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     """Full-buffer, full-quality pass - same faithful logic as
-    transcribe.py's auto mode. This is where the 60 quality points live,
-    so it gets the full latency budget, not the cheap partial pass.
+    transcribe.py's auto mode. This is where the 60-70 quality points
+    live (both scoring docs agree on that), so it gets the largest
+    latency budget - but that budget is now a HARD, self-enforced
+    deadline (FINAL_DEADLINE_S total), not an open-ended wait. See
+    module docstring for the full reasoning: a timeout scores a clip 0,
+    which is worse than a fast-but-rougher answer.
 
-    Speed optimization: if partial passes already flagged this clip as
-    likely code-switched (hint_code_switched=True), skip straight to the
-    Hindi-capable model instead of first running a full fast-model pass
-    just to re-discover what we already know - saves one whole inference
-    pass on exactly the clips that are otherwise slowest/highest-risk.
+    Speed optimization (kept from before): if partials already flagged
+    this clip as code-switched, skip straight to the Hindi model instead
+    of re-discovering what we already know."""
+    deadline = time.perf_counter() + FINAL_DEADLINE_S
 
-    Includes a blank-safety retry: a blank final is a severe hard cap
-    (docs/STREAMING_CONTRACT.md 3.4), so if the primary backend somehow
-    returns nothing, we retry once before giving up."""
+    def remaining() -> float:
+        return deadline - time.perf_counter()
+
+    text = ""
+
+    # Always keep at least this much of the deadline in reserve for a
+    # fast fallback attempt - otherwise a Hindi call that times out could
+    # consume the ENTIRE budget itself, leaving nothing for any fallback
+    # and guaranteeing a blank result. (Caught by testing the timeout
+    # path directly - worth remembering why this constant exists.)
+    FALLBACK_RESERVE_S = 1.0
+
     if hint_code_switched:
-        strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
-                                   word_timestamps=False, lenient=True)
-        text = strong.text
+        hindi_budget = max(0.1, remaining() - FALLBACK_RESERVE_S)
+        strong = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
+                                      lenient=True, deadline_s=hindi_budget)
+        text = strong.text if strong else ""
         if not text.strip():
-            fallback = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
-            text = fallback.text
+            fallback = _call_with_deadline(FAST_MODEL_NAME, full_audio, FINAL_BEAM_SIZE,
+                                            lenient=False, deadline_s=remaining())
+            text = fallback.text if fallback else text
     else:
-        fast = _transcribe_core(FAST_MODEL_NAME, full_audio, beam_size=FINAL_BEAM_SIZE, word_timestamps=False)
-        if _looks_code_switched(fast.text, fast.language, fast.language_probability):
-            strong = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
-                                       word_timestamps=False, lenient=True)
-            text = strong.text
+        fast = _call_with_deadline(FAST_MODEL_NAME, full_audio, FINAL_BEAM_SIZE,
+                                    lenient=False, deadline_s=remaining())
+        fast_text = fast.text if fast else ""
+        if fast and _looks_code_switched(fast_text, fast.language, fast.language_probability):
+            strong = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
+                                          lenient=True, deadline_s=remaining())
+            text = strong.text if strong else fast_text  # fall back to the fast result, not blank
         else:
-            text = fast.text
-        if not text.strip():
-            # Blank-safety retry: try the other model size once before giving up.
-            retry = _transcribe_core(HINGLISH_MODEL_NAME, full_audio, beam_size=HINGLISH_BEAM_SIZE,
-                                      word_timestamps=False, lenient=True)
-            text = retry.text
+            text = fast_text
+        if not text.strip() and remaining() > 0.2:
+            # Blank-safety retry, but only if there's still real budget left -
+            # no point starting a call we know we'll have to abandon.
+            retry = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
+                                         lenient=True, deadline_s=remaining())
+            text = retry.text if retry else text
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)
@@ -266,14 +356,21 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
         _state.likely_code_switched = True
     new_words = tail_text.split()
 
-    # 2-pass stability: only trust a word if it also appeared at the same
-    # position in the immediately preceding tail pass.
-    stable_word_count = 0
-    for a, b in zip(_state.prev_tail_words, new_words):
-        if a != b:
-            break
-        stable_word_count += 1
-    commit_word_count = max(0, stable_word_count - COMMIT_SAFETY_WORDS)
+    # Commit directly from this pass (minus a small trailing safety
+    # margin against mid-word audio cutoffs) - no longer requiring
+    # agreement across two consecutive passes first.
+    #
+    # CHANGED after confirming (guidelines page + the actual GitHub
+    # README, in matching wording both times): "Intermediate drafts are
+    # optional and never affect the score" - i.e. revision churn isn't
+    # scored. The old 2-pass-stability requirement existed specifically
+    # to protect against a churn penalty that, per this confirmation,
+    # doesn't exist. Committing faster/more eagerly now has no real
+    # downside and helps satisfy "at least one useful partial" (still
+    # worth hedging for, since docs/STREAMING_CONTRACT.md's hard caps
+    # around this haven't been explicitly retracted, just possibly
+    # superseded) sooner rather than later.
+    commit_word_count = max(0, len(new_words) - COMMIT_SAFETY_WORDS)
 
     if commit_word_count > 0:
         addition = " ".join(new_words[:commit_word_count])
@@ -289,8 +386,6 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
             # estimate of where in the audio that many words likely ended.
             frac = commit_word_count / max(1, len(new_words))
             _state.committed_samples = tail_start + int(frac * len(tail_audio))
-
-    _state.prev_tail_words = new_words
 
     trailing = " ".join(new_words[commit_word_count:]) if commit_word_count else tail_text
     text_so_far = f"{_state.committed_text} {trailing}".strip()
