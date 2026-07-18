@@ -96,6 +96,19 @@ _WhisperModel = None
 _sanscript = None
 _BACKEND: Optional[str] = None  # "mlx" or "faster_whisper", set on first use
 
+# Srota (Qwen3-ASR Hinglish fine-tune) - a separate, optional, best-effort
+# TOP tier used only for the Hindi/code-switch pass. Unlike the mlx-vs-
+# faster-whisper choice above (both run the SAME generic model, just on
+# different hardware), Srota is a genuinely different, purpose-built
+# model - the same category RambleFix's own finalizer uses. Confirmed via
+# its model card: Apache-2.0, ~0.8B params, 15.85% WER on Hinglish
+# conversational speech. NOT platform-restricted (PyTorch is cross-
+# platform), so this can actually be tested on Windows/Linux CPU too -
+# unlike mlx-whisper, which only runs on the real scoring Mac.
+_qwen_asr_model = None
+_SROTA_AVAILABLE: Optional[bool] = None  # None = not yet attempted
+SROTA_MODEL_ID = os.environ.get("STT_SROTA_MODEL", "moorlee/qwen3-asr-0.6b-hinglish")
+
 
 def _lazy_imports() -> None:
     global _mlx_whisper, _WhisperModel, _sanscript, _BACKEND
@@ -112,6 +125,91 @@ def _lazy_imports() -> None:
     if _sanscript is None:
         from indic_transliteration import sanscript  # type: ignore
         _sanscript = sanscript
+
+
+def _try_load_srota() -> bool:
+    """Best-effort: try to load Srota once. Returns True if it's ready to
+    use. Never raises - any failure (missing package, no compatible
+    device, download error, etc.) just means we don't get to use it, and
+    every caller already knows how to fall back to the Whisper pipeline.
+    Picks device/dtype defensively since the model card's example targets
+    CUDA + FlashAttention2, neither of which exist on the scoring Mac."""
+    global _qwen_asr_model, _SROTA_AVAILABLE
+    if _SROTA_AVAILABLE is not None:
+        return _SROTA_AVAILABLE
+    try:
+        import torch  # type: ignore
+        from qwen_asr import Qwen3ASRModel  # type: ignore
+
+        if torch.cuda.is_available():
+            device_map, dtype, attn_impl = "cuda:0", torch.bfloat16, "flash_attention_2"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            # Apple GPU. float16 (not bf16) - more consistently supported
+            # across PyTorch/MPS versions; flash_attention_2 is CUDA-only.
+            device_map, dtype, attn_impl = "mps", torch.float16, None
+        else:
+            device_map, dtype, attn_impl = "cpu", torch.float32, None
+
+        kwargs: Dict[str, Any] = dict(dtype=dtype, device_map=device_map)
+        if attn_impl:
+            kwargs["attn_implementation"] = attn_impl
+        try:
+            _qwen_asr_model = Qwen3ASRModel.from_pretrained(SROTA_MODEL_ID, **kwargs)
+        except TypeError:
+            kwargs.pop("attn_implementation", None)
+            _qwen_asr_model = Qwen3ASRModel.from_pretrained(SROTA_MODEL_ID, **kwargs)
+        _SROTA_AVAILABLE = True
+    except Exception:
+        _qwen_asr_model = None
+        _SROTA_AVAILABLE = False
+    return _SROTA_AVAILABLE
+
+
+def _write_temp_wav(audio: np.ndarray, sample_rate: int = 16000) -> str:
+    """Srota's confirmed API takes a file path, not an in-memory array
+    (unlike faster-whisper/mlx-whisper, which both accept arrays
+    directly) - needed for the streaming path in draft.py, which only
+    ever has audio in memory. Uses the stdlib wave module, no extra
+    dependency."""
+    import tempfile
+    import wave
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    pcm16 = np.clip(audio * 32768.0, -32768, 32767).astype(np.int16)
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(pcm16.tobytes())
+    return path
+
+
+def _srota_transcribe(audio: Any) -> EngineResult:
+    """Transcribe with Srota. Raises on any failure - caller (
+    _transcribe_core) catches this and falls back to the Whisper
+    pipeline, exactly like the mlx-vs-faster-whisper fallback."""
+    t0 = time.perf_counter()
+    temp_path: Optional[str] = None
+    try:
+        if isinstance(audio, str):
+            audio_path = audio
+        else:
+            temp_path = _write_temp_wav(audio)
+            audio_path = temp_path
+        results = _qwen_asr_model.transcribe(audio=audio_path, language=None)
+        text = (results[0].text or "").strip() if results else ""
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    return EngineResult(
+        text=text, language=None, language_probability=None,
+        duration_ms=dt_ms, engine_name=f"srota-{SROTA_MODEL_ID}",
+        already_native_script=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +266,11 @@ class EngineResult:
     duration_ms: float
     engine_name: str
     words: List[Tuple[str, float]] = field(default_factory=list)  # (word, end_time_s)
+    already_native_script: bool = False  # True for Srota - its output is
+                                          # ALREADY natural mixed Devanagari+
+                                          # Latin script; romanizing it would
+                                          # be wrong, unlike Whisper's output
+                                          # which needs romanization
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +343,20 @@ def _transcribe_core(
     _lazy_imports()
     t0 = time.perf_counter()
     label = engine_label or f"{_BACKEND}-{model_size}"
+
+    # Srota tier: only for the Hindi/code-switch model slot, and only
+    # when word-level timestamps aren't needed (Srota's confirmed API
+    # doesn't expose them - in practice this is never a conflict, since
+    # draft.py only ever requests word_timestamps=True for FAST_MODEL_NAME,
+    # never for HINGLISH_MODEL_NAME). Any failure here - missing package,
+    # no compatible device, a bad download, a runtime error - falls
+    # through to the existing mlx/faster-whisper Whisper pipeline below,
+    # exactly like the mlx-to-faster-whisper fallback already does.
+    if model_size == HINGLISH_MODEL_NAME and not word_timestamps and _try_load_srota():
+        try:
+            return _srota_transcribe(audio)
+        except Exception:
+            pass  # fall through to Whisper below - same safety-net pattern as mlx
 
     if _BACKEND == "mlx":
         try:
@@ -415,6 +532,8 @@ def transcribe(
 
     t_asr0 = time.perf_counter()
 
+    final_already_native = False  # True if Srota produced the final text - skip romanization
+
     if mode == "fast":
         fast = _run_whisper(FAST_MODEL_NAME, input_path, f"faster-whisper-{FAST_MODEL_NAME}")
         raw_candidates.append({"engine": fast.engine_name, "text": fast.text})
@@ -428,12 +547,13 @@ def transcribe(
             HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
         )
         raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
-        model_ids.append(f"faster-whisper-{HINGLISH_MODEL_NAME}")
+        model_ids.append(strong.engine_name)
         final_text = strong.text
+        final_already_native = strong.already_native_script
         language_guess = "hinglish" if _looks_code_switched(
             strong.text, strong.language, strong.language_probability
         ) else (strong.language or "unknown")
-        romanize = mode == "hinglish"
+        romanize = mode == "hinglish" and not final_already_native
 
     else:  # auto
         fast = _run_whisper(FAST_MODEL_NAME, input_path, f"faster-whisper-{FAST_MODEL_NAME}")
@@ -445,13 +565,14 @@ def transcribe(
                 HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
             )
             raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
-            model_ids.append(f"faster-whisper-{HINGLISH_MODEL_NAME}")
+            model_ids.append(strong.engine_name)
             final_text = strong.text
+            final_already_native = strong.already_native_script
             language_guess = "hinglish"
         else:
             final_text = fast.text
             language_guess = fast.language or "en"
-        romanize = True
+        romanize = not final_already_native
 
     asr_ms = (time.perf_counter() - t_asr0) * 1000.0
 

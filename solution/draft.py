@@ -278,6 +278,7 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
         return deadline - time.perf_counter()
 
     text = ""
+    already_native = False  # True if Srota produced the winning text - skip romanization
 
     # Always keep at least this much of the deadline in reserve for a
     # fast fallback attempt - otherwise a Hindi call that times out could
@@ -291,10 +292,12 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
         strong = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
                                       lenient=True, deadline_s=hindi_budget)
         text = strong.text if strong else ""
+        already_native = strong.already_native_script if strong else False
         if not text.strip():
             fallback = _call_with_deadline(FAST_MODEL_NAME, full_audio, FINAL_BEAM_SIZE,
                                             lenient=False, deadline_s=remaining())
             text = fallback.text if fallback else text
+            already_native = False  # fast model is always Whisper
     else:
         fast = _call_with_deadline(FAST_MODEL_NAME, full_audio, FINAL_BEAM_SIZE,
                                     lenient=False, deadline_s=remaining())
@@ -303,6 +306,7 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
             strong = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
                                           lenient=True, deadline_s=remaining())
             text = strong.text if strong else fast_text  # fall back to the fast result, not blank
+            already_native = strong.already_native_script if strong else False
         else:
             text = fast_text
         if not text.strip() and remaining() > 0.2:
@@ -311,11 +315,12 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
             retry = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
                                          lenient=True, deadline_s=remaining())
             text = retry.text if retry else text
+            already_native = retry.already_native_script if retry else already_native
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)
 
-    return _romanize(text).strip()
+    return (text if already_native else _romanize(text)).strip()
 
 
 def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
