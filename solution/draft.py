@@ -129,10 +129,16 @@ MIN_WALL_INTERVAL_S = 0.6        # throttle: don't re-run more often than this
                                   # for the final instead)
 
 # Background pool used for deadline-bounded calls (see _call_with_deadline).
-# A few extra workers beyond what we'd normally need in flight at once, as
-# headroom against orphaned timed-out calls still running when the next
-# one is submitted (Python can't forcibly cancel a blocking call).
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr")
+# WIDENED after real organizer feedback: a hung call (confirmed cause:
+# an unpinned qwen_asr/Transformers version mismatch making Srota calls
+# hang instead of erroring) occupied workers indefinitely, and with only
+# 4 workers, later clips' calls got stuck queued behind them with no
+# free worker - "overload later clips", exactly as diagnosed. Threads
+# themselves are cheap (the 32GB scoring machine can hold many idle/
+# blocked ones); the earlier low count optimized for the wrong thing.
+# This alone doesn't fix a root-cause hang, but it stops one bad call
+# from cascading into starving every clip after it.
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="asr")
 
 # Hard wall-clock budget for the ENTIRE final pass (fast check + possible
 # Hindi escalation + possible retry, all combined). Chosen well under
@@ -229,21 +235,22 @@ def _bytes_to_f32(buf: bytes) -> np.ndarray:
 # Beam size for the FINAL pass only (partials always use beam_size=1 -
 # cheap, run frequently). Lower = faster but slightly less accurate.
 # Tunable without touching code, e.g. if latency is still too high:
-#   set STT_FINAL_BEAM_SIZE=2
-# Default lowered from 5 to 3 after "too slow" feedback - a reasonable
-# middle ground, but genuinely a guess without being able to benchmark
-# on the real scoring Mac. Turn it down further if still too slow, or
-# back up toward 5 if speed turns out fine and quality is the bottleneck.
-FINAL_BEAM_SIZE = int(os.environ.get("STT_FINAL_BEAM_SIZE", "3"))
+#   set STT_FINAL_BEAM_SIZE=1
+# Lowered again (3 -> 2) after review: beam 5 is genuinely too expensive
+# for a ~2s target, and this specific lever is safe to pull hard since it
+# doesn't touch the part that actually caused the last failure (that was
+# Srota hanging, not Whisper's beam search being slow).
+FINAL_BEAM_SIZE = int(os.environ.get("STT_FINAL_BEAM_SIZE", "2"))
 
-# Separate, higher beam size for the Hindi/code-switch pass specifically.
-# After "English got stronger, mixed Hindi-English still dropped too
-# much" feedback: the across-the-board beam_size cut above likely helped
-# the easy English path but hurt the hard Hindi path, which is exactly
-# where completeness matters most (40+20 = 60 of 100 points). This pass
-# also runs with lenient=True (see transcribe.py) to reduce content
-# being silently dropped as "low confidence" or "no speech".
-HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "5"))
+# Separate beam size for the Hindi/code-switch pass specifically.
+# Brought down from 5 to 2 for the same reason as above - the earlier
+# bump to 5 was reasoning about content-dropping on Hindi clips, which
+# is a real concern, but latency is 35% of the score and a hang/timeout
+# costs a clip far more than a slightly-less-thorough beam search does.
+# This pass still runs with lenient=True (see transcribe.py) to reduce
+# content being silently dropped as "low confidence" or "no speech" -
+# that lever is independent of beam size and stays in place.
+HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "2"))
 
 
 def _run_tail_partial(tail_audio: np.ndarray) -> Tuple[str, List[Tuple[str, float]], Optional[str], Optional[float]]:
@@ -294,6 +301,12 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
         text = strong.text if strong else ""
         already_native = strong.already_native_script if strong else False
         if not text.strip():
+            # Fall back to the FAST model, not a second Hindi attempt -
+            # a different, cheaper call, not a repeat of the one that
+            # just failed/timed out. See module docstring: only ONE
+            # attempt at the (potentially slow/hanging) Hindi pass per
+            # clip, ever - confirmed necessary by real feedback after a
+            # retry-based design let orphaned hung calls cascade.
             fallback = _call_with_deadline(FAST_MODEL_NAME, full_audio, FINAL_BEAM_SIZE,
                                             lenient=False, deadline_s=remaining())
             text = fallback.text if fallback else text
@@ -309,13 +322,11 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
             already_native = strong.already_native_script if strong else False
         else:
             text = fast_text
-        if not text.strip() and remaining() > 0.2:
-            # Blank-safety retry, but only if there's still real budget left -
-            # no point starting a call we know we'll have to abandon.
-            retry = _call_with_deadline(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
-                                         lenient=True, deadline_s=remaining())
-            text = retry.text if retry else text
-            already_native = retry.already_native_script if retry else already_native
+        # NOTE: deliberately no second Hindi attempt here if text is still
+        # blank - we already have fast_text as a safety net, and a retry
+        # would be exactly the "second slow call per clip" pattern that
+        # caused cascading overload in practice. One bounded Hindi
+        # attempt per clip, period.
 
     if _detect_repetition_loop(text):
         text = _dedupe_repetition(text)

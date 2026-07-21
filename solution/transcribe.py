@@ -109,6 +109,22 @@ _qwen_asr_model = None
 _SROTA_AVAILABLE: Optional[bool] = None  # None = not yet attempted
 SROTA_MODEL_ID = os.environ.get("STT_SROTA_MODEL", "moorlee/qwen3-asr-0.6b-hinglish")
 
+# DISABLED BY DEFAULT after real organizer feedback: this integration
+# caused 7 of 8 clips to go blank/time out (median final latency 12.2s),
+# dropping the score from 12.50 to 6.25 - worse than not having it at
+# all. Root cause per the organizer's own diagnosis: a qwen_asr/
+# Transformers version mismatch made calls hang instead of erroring
+# cleanly, and the resulting orphaned background threads (a known,
+# explicitly-documented limitation of the thread-based deadline
+# mechanism - see draft.py) piled up and overloaded later clips. This
+# was a real, costly lesson in shipping an integration that couldn't be
+# tested before submission. The code is left in place, gated behind an
+# explicit opt-in, in case dependency versions get pinned/verified later
+# - but it must NOT run by default until that's actually confirmed
+# working on real Mac hardware:
+#   set STT_ENABLE_SROTA=1
+SROTA_ENABLED = os.environ.get("STT_ENABLE_SROTA", "0") == "1"
+
 
 def _lazy_imports() -> None:
     global _mlx_whisper, _WhisperModel, _sanscript, _BACKEND
@@ -133,8 +149,13 @@ def _try_load_srota() -> bool:
     device, download error, etc.) just means we don't get to use it, and
     every caller already knows how to fall back to the Whisper pipeline.
     Picks device/dtype defensively since the model card's example targets
-    CUDA + FlashAttention2, neither of which exist on the scoring Mac."""
+    CUDA + FlashAttention2, neither of which exist on the scoring Mac.
+
+    Gated behind SROTA_ENABLED (default off) after a confirmed real-world
+    failure - see the comment above that flag for the full story."""
     global _qwen_asr_model, _SROTA_AVAILABLE
+    if not SROTA_ENABLED:
+        return False
     if _SROTA_AVAILABLE is not None:
         return _SROTA_AVAILABLE
     try:
