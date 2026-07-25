@@ -2,75 +2,55 @@
 solution/transcribe.py
 -----------------------
 Local, offline dual-language (Hindi+English) speech-to-text engine.
+Batch contract: python -m solution.transcribe --input clip.wav --mode auto --output result.json
 
-Contract (matches the builderr challenge README):
+REWRITTEN FROM SCRATCH after direct organizer feedback:
 
-    python -m solution.transcribe --input clip.wav --mode auto --output result.json
+    "It did not replace your previous published result because the
+    latest run produced too few usable final transcripts. For the next
+    revision, first make every clip return a final transcript reliably
+    under the harness. Then improve Hindi-English accuracy and latency.
+    Completeness is the main issue to solve before tuning the model
+    further." - Soham
 
-Modes:
-    auto      - product default. Fast path for plain English, automatically
-                routes to the higher-quality Hindi-capable path if the clip
-                looks like it contains Hindi / code-switching.
-    fast      - lowest-latency path only. Best for English / Indian-English.
-    hinglish  - always uses the stronger Hindi-capable path. Slower, but
-                keeps code-switched speech faithful instead of translating
-                it away into English.
-    verbatim  - like hinglish, but does not romanize Devanagari script -
-                returns exactly what the model decoded.
+That is the governing priority for this rewrite: a clip that returns a
+plain, imperfect transcript beats a clip that returns nothing, every
+time. Every design choice below optimizes for "always returns something
+quickly" first, and accuracy second.
 
-Design (why it's built this way):
+What changed from earlier attempts, and why:
+    - Srota (Qwen3-ASR Hinglish fine-tune) is REMOVED, not just disabled.
+      It caused a confirmed real failure (score dropped 12.50 -> 6.25,
+      7 of 8 clips blank/timed out) due to a dependency version mismatch
+      that made calls hang instead of erroring. Re-adding any new,
+      untestable model dependency this close to the deadline repeats the
+      exact mistake that already cost the most points. If it's ever
+      revisited, it needs to be verified working on real Apple Silicon
+      FIRST, not shipped on the promise that it should work.
+    - Every model call is wrapped in a hard, self-enforced timeout using
+      a FRESH executor created per call (see _call_bounded), not a
+      shared pool. The organizer's own diagnosis was that a shared pool
+      let orphaned hung calls starve later clips. A disposable per-call
+      executor can't do that - a hung call is abandoned on its own,
+      never blocking a future call's ability to get a worker.
+    - Only ONE attempt at the slower Hindi-capable model per clip, ever.
+      No retry-on-blank. A second attempt at a call that just failed is
+      exactly the "second slow/hanging call" pattern that caused the
+      cascading failure last time.
+    - Nothing in this file can raise past its own boundary. Every
+      public-facing function catches its own failures and returns a
+      valid, safe result instead. A bug in this code should degrade to
+      "worse transcript" or "blank," never to "crash" or "hang."
 
-    A single Whisper pass in "translate" mode silently turns Hindi words
-    into English -> that fails the challenge's faithfulness gate.
-    A single Whisper pass in "transcribe" mode on a *multilingual* model
-    keeps the original words, but may render Hindi in Devanagari script,
-    which the challenge does not want as the default ("auto") output.
-
-    So this engine:
-      1. Runs a small/fast multilingual Whisper model first (the "draft").
-      2. Looks at the language probabilities + the decoded text itself to
-         decide whether the clip is plain English or Hindi/code-switched.
-      3. Only for clips that look mixed does it pay for a second, larger
-         model pass (the "finalizer") - this keeps p95 latency low for the
-         common English case while still being faithful on the hard case.
-      4. Romanizes any Devanagari the model produced (Hindi words spoken by
-         the user), instead of translating them - so "yeh file update kar
-         do" stays "yeh file update kar do", not "update this file".
-
-INFERENCE BACKEND (updated after real scoring feedback: "too slow"):
-    docs/STREAMING_CONTRACT.md confirms the scoring Mac's "on-device
-    accelerator (GPU / Apple Neural Engine) is available to the scored
-    process." faster-whisper's CTranslate2 backend does NOT use Apple's
-    GPU/ANE - it's CPU-only there, which is almost certainly why the first
-    submission scored "too slow". This module now prefers mlx-whisper
-    (Apple's MLX framework - genuinely GPU/ANE-accelerated on Apple
-    Silicon) when it's importable, and falls back to faster-whisper on
-    CPU otherwise (e.g. on your Windows dev machine, where mlx isn't
-    available - so local testing keeps working exactly as before).
-
-    CAVEAT: I can't run or benchmark this on a real Mac. The mlx-whisper
-    API and exact mlx-community model repo names are taken from public
-    docs/examples, not verified against the actual scoring box. The code
-    below tries a couple of plausible repo-name variants and falls back
-    to faster-whisper on any failure, so a wrong guess should degrade to
-    "as before", not crash - but if you can get real logs/timing off a
-    Mac (even a friend's), that would let us confirm this is actually
-    faster rather than just theoretically faster.
-
-Models used (declare licenses so the tool can ship for free):
-    - mlx-whisper (MIT, Apple) + mlx-community Whisper checkpoints
-      (converted from OpenAI's MIT-licensed Whisper weights) - primary,
-      GPU/ANE-accelerated backend on Apple Silicon.
-    - faster-whisper (MIT) running OpenAI Whisper checkpoints (MIT
-      weights) - fallback backend (CPU-only, used on non-Apple machines
-      or if mlx-whisper fails to load).
-    - indic-transliteration (MIT) for pure-Python Devanagari -> Roman
-      script conversion. No network calls, no cloud APIs, ever.
-
-Everything below only touches local files / local model weights already
-cached on disk. No network calls are made inside this module once models
-are warmed up (mirrors how faster-whisper needed one-time network to
-download weights before offline scoring).
+Models (declared per the rules - only commercial-friendly licenses):
+    - mlx-whisper (MIT, Apple) - preferred backend on Apple Silicon,
+      genuinely GPU/ANE-accelerated, running OpenAI's MIT-licensed
+      Whisper checkpoints.
+    - faster-whisper (MIT) - fallback backend, used automatically if
+      mlx-whisper isn't available or fails, and on non-Apple machines
+      (e.g. Windows, for local development/testing).
+    - indic-transliteration (MIT) - pure-Python Devanagari -> Roman
+      script conversion, no models or network calls involved.
 """
 
 from __future__ import annotations
@@ -80,6 +60,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -87,43 +68,48 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Backend selection: prefer mlx-whisper (Apple GPU/ANE) if importable,
-# fall back to faster-whisper (CPU-only, works everywhere including your
-# Windows dev machine) otherwise.
+# Config
+# ---------------------------------------------------------------------------
+FAST_MODEL_NAME = os.environ.get("STT_FAST_MODEL", "base")
+HINGLISH_MODEL_NAME = os.environ.get("STT_HINGLISH_MODEL", "small")
+DEVICE = os.environ.get("STT_DEVICE", "cpu")               # faster-whisper fallback only
+COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")   # faster-whisper fallback only
+
+# Beam sizes kept low deliberately - speed and reliability outrank a
+# marginal accuracy gain from a wider beam search right now.
+FAST_BEAM_SIZE = int(os.environ.get("STT_FAST_BEAM_SIZE", "2"))
+HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "2"))
+
+# Hard per-call wall-clock budgets. Generous enough that a normally-
+# completing call isn't cut off prematurely (which would itself hurt
+# completeness), but bounded so nothing can hang forever.
+FAST_CALL_DEADLINE_S = float(os.environ.get("STT_FAST_DEADLINE_S", "6.0"))
+HINGLISH_CALL_DEADLINE_S = float(os.environ.get("STT_HINGLISH_DEADLINE_S", "6.0"))
+
+DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
+HINDI_PROB_THRESHOLD = 0.12
+EN_CONFIDENCE_THRESHOLD = 0.65
+HINGLISH_HINT_WORDS = {
+    "hai", "hain", "kar", "karo", "kya", "nahi", "nahin", "ka", "ki", "ke",
+    "yeh", "woh", "mein", "aur", "bhi", "toh", "kro", "acha", "theek",
+}
+REPEAT_NGRAM = 4
+REPEAT_MIN_RUNS = 4
+
+_MLX_REPO_CANDIDATES: Dict[str, List[str]] = {
+    "base": ["mlx-community/whisper-base-mlx", "mlx-community/whisper-base"],
+    "small": ["mlx-community/whisper-small-mlx", "mlx-community/whisper-small"],
+}
+
+# ---------------------------------------------------------------------------
+# Backend selection - resolved once, lazily, on first real use
 # ---------------------------------------------------------------------------
 _mlx_whisper = None
 _WhisperModel = None
 _sanscript = None
-_BACKEND: Optional[str] = None  # "mlx" or "faster_whisper", set on first use
-
-# Srota (Qwen3-ASR Hinglish fine-tune) - a separate, optional, best-effort
-# TOP tier used only for the Hindi/code-switch pass. Unlike the mlx-vs-
-# faster-whisper choice above (both run the SAME generic model, just on
-# different hardware), Srota is a genuinely different, purpose-built
-# model - the same category RambleFix's own finalizer uses. Confirmed via
-# its model card: Apache-2.0, ~0.8B params, 15.85% WER on Hinglish
-# conversational speech. NOT platform-restricted (PyTorch is cross-
-# platform), so this can actually be tested on Windows/Linux CPU too -
-# unlike mlx-whisper, which only runs on the real scoring Mac.
-_qwen_asr_model = None
-_SROTA_AVAILABLE: Optional[bool] = None  # None = not yet attempted
-SROTA_MODEL_ID = os.environ.get("STT_SROTA_MODEL", "moorlee/qwen3-asr-0.6b-hinglish")
-
-# DISABLED BY DEFAULT after real organizer feedback: this integration
-# caused 7 of 8 clips to go blank/time out (median final latency 12.2s),
-# dropping the score from 12.50 to 6.25 - worse than not having it at
-# all. Root cause per the organizer's own diagnosis: a qwen_asr/
-# Transformers version mismatch made calls hang instead of erroring
-# cleanly, and the resulting orphaned background threads (a known,
-# explicitly-documented limitation of the thread-based deadline
-# mechanism - see draft.py) piled up and overloaded later clips. This
-# was a real, costly lesson in shipping an integration that couldn't be
-# tested before submission. The code is left in place, gated behind an
-# explicit opt-in, in case dependency versions get pinned/verified later
-# - but it must NOT run by default until that's actually confirmed
-# working on real Mac hardware:
-#   set STT_ENABLE_SROTA=1
-SROTA_ENABLED = os.environ.get("STT_ENABLE_SROTA", "0") == "1"
+_BACKEND: Optional[str] = None
+_model_cache: Dict[str, Any] = {}
+_resolved_mlx_repo: Dict[str, str] = {}
 
 
 def _lazy_imports() -> None:
@@ -139,495 +125,286 @@ def _lazy_imports() -> None:
         from faster_whisper import WhisperModel  # type: ignore
         _WhisperModel = WhisperModel
     if _sanscript is None:
-        from indic_transliteration import sanscript  # type: ignore
-        _sanscript = sanscript
-
-
-def _try_load_srota() -> bool:
-    """Best-effort: try to load Srota once. Returns True if it's ready to
-    use. Never raises - any failure (missing package, no compatible
-    device, download error, etc.) just means we don't get to use it, and
-    every caller already knows how to fall back to the Whisper pipeline.
-    Picks device/dtype defensively since the model card's example targets
-    CUDA + FlashAttention2, neither of which exist on the scoring Mac.
-
-    Gated behind SROTA_ENABLED (default off) after a confirmed real-world
-    failure - see the comment above that flag for the full story."""
-    global _qwen_asr_model, _SROTA_AVAILABLE
-    if not SROTA_ENABLED:
-        return False
-    if _SROTA_AVAILABLE is not None:
-        return _SROTA_AVAILABLE
-    try:
-        import torch  # type: ignore
-        from qwen_asr import Qwen3ASRModel  # type: ignore
-
-        if torch.cuda.is_available():
-            device_map, dtype, attn_impl = "cuda:0", torch.bfloat16, "flash_attention_2"
-        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            # Apple GPU. float16 (not bf16) - more consistently supported
-            # across PyTorch/MPS versions; flash_attention_2 is CUDA-only.
-            device_map, dtype, attn_impl = "mps", torch.float16, None
-        else:
-            device_map, dtype, attn_impl = "cpu", torch.float32, None
-
-        kwargs: Dict[str, Any] = dict(dtype=dtype, device_map=device_map)
-        if attn_impl:
-            kwargs["attn_implementation"] = attn_impl
         try:
-            _qwen_asr_model = Qwen3ASRModel.from_pretrained(SROTA_MODEL_ID, **kwargs)
-        except TypeError:
-            kwargs.pop("attn_implementation", None)
-            _qwen_asr_model = Qwen3ASRModel.from_pretrained(SROTA_MODEL_ID, **kwargs)
-        _SROTA_AVAILABLE = True
-    except Exception:
-        _qwen_asr_model = None
-        _SROTA_AVAILABLE = False
-    return _SROTA_AVAILABLE
-
-
-def _write_temp_wav(audio: np.ndarray, sample_rate: int = 16000) -> str:
-    """Srota's confirmed API takes a file path, not an in-memory array
-    (unlike faster-whisper/mlx-whisper, which both accept arrays
-    directly) - needed for the streaming path in draft.py, which only
-    ever has audio in memory. Uses the stdlib wave module, no extra
-    dependency."""
-    import tempfile
-    import wave
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    pcm16 = np.clip(audio * 32768.0, -32768, 32767).astype(np.int16)
-    with wave.open(path, "wb") as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(sample_rate)
-        f.writeframes(pcm16.tobytes())
-    return path
-
-
-def _srota_transcribe(audio: Any) -> EngineResult:
-    """Transcribe with Srota. Raises on any failure - caller (
-    _transcribe_core) catches this and falls back to the Whisper
-    pipeline, exactly like the mlx-vs-faster-whisper fallback."""
-    t0 = time.perf_counter()
-    temp_path: Optional[str] = None
-    try:
-        if isinstance(audio, str):
-            audio_path = audio
-        else:
-            temp_path = _write_temp_wav(audio)
-            audio_path = temp_path
-        results = _qwen_asr_model.transcribe(audio=audio_path, language=None)
-        text = (results[0].text or "").strip() if results else ""
-    finally:
-        if temp_path:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-    dt_ms = (time.perf_counter() - t0) * 1000.0
-    return EngineResult(
-        text=text, language=None, language_probability=None,
-        duration_ms=dt_ms, engine_name=f"srota-{SROTA_MODEL_ID}",
-        already_native_script=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Config - tweak via environment variables, no code changes needed.
-# ---------------------------------------------------------------------------
-FAST_MODEL_NAME = os.environ.get("STT_FAST_MODEL", "base")
-HINGLISH_MODEL_NAME = os.environ.get("STT_HINGLISH_MODEL", "small")
-DEVICE = os.environ.get("STT_DEVICE", "cpu")            # only used by faster-whisper fallback
-COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")  # only used by faster-whisper fallback
-
-# mlx-community repo name candidates per logical size. Naming on the Hub
-# is inconsistent (some have a "-mlx" suffix, some don't) and I couldn't
-# verify these against the real scoring Mac, so we try a few and cache
-# whichever one actually works.
-_MLX_REPO_CANDIDATES: Dict[str, List[str]] = {
-    "base": ["mlx-community/whisper-base-mlx", "mlx-community/whisper-base"],
-    "small": ["mlx-community/whisper-small-mlx", "mlx-community/whisper-small"],
-}
-_resolved_mlx_repo: Dict[str, str] = {}
-
-# If the fast pass thinks there's at least this much probability mass on a
-# non-English language (mainly Hindi), or the fast pass's own text contains
-# Devanagari / common Hinglish romanized tokens, we route to the stronger
-# hinglish model instead of trusting the fast draft.
-HINDI_PROB_THRESHOLD = 0.12
-
-# If the fast model claims "English" but isn't very confident about it,
-# that's itself a signal worth double-checking with the stronger model -
-# low-confidence English guesses are exactly how a fast model quietly
-# mis-hears Hindi as fluent-sounding English on short/noisy clips.
-EN_CONFIDENCE_THRESHOLD = 0.65
-
-DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-
-# A tiny, editable set of common Hinglish function words that show up even
-# when someone is mostly speaking English - a cheap signal that this clip is
-# code-switched and deserves the stronger pass. This is a heuristic, not a
-# hard-coded answer map: it never changes what gets *output*, only which
-# model gets a second look.
-HINGLISH_HINT_WORDS = {
-    "hai", "hain", "kar", "karo", "kya", "nahi", "nahin", "ka", "ki", "ke",
-    "yeh", "woh", "mein", "aur", "bhi", "toh", "kro", "acha", "theek",
-}
-
-REPEAT_NGRAM = 4       # look at runs of N words
-REPEAT_MIN_RUNS = 4    # 4+ consecutive repeats of the same N-gram = loop
+            from indic_transliteration import sanscript  # type: ignore
+            _sanscript = sanscript
+        except Exception:
+            _sanscript = False  # sentinel: romanization unavailable, skip it silently
 
 
 @dataclass
 class EngineResult:
-    text: str
-    language: Optional[str]
-    language_probability: Optional[float]
-    duration_ms: float
-    engine_name: str
-    words: List[Tuple[str, float]] = field(default_factory=list)  # (word, end_time_s)
-    already_native_script: bool = False  # True for Srota - its output is
-                                          # ALREADY natural mixed Devanagari+
-                                          # Latin script; romanizing it would
-                                          # be wrong, unlike Whisper's output
-                                          # which needs romanization
+    text: str = ""
+    language: Optional[str] = None
+    language_probability: Optional[float] = None
+    engine_name: str = "none"
 
 
-# ---------------------------------------------------------------------------
-# Model loading (cached across calls within one process)
-# ---------------------------------------------------------------------------
-_model_cache: Dict[str, Any] = {}
-
-
-def _get_model(name: str):
-    """Only used by the faster-whisper fallback path - mlx-whisper manages
-    its own model caching internally keyed by repo string."""
-    _lazy_imports()
+def _get_faster_whisper_model(name: str):
     if name not in _model_cache:
         _model_cache[name] = _WhisperModel(name, device=DEVICE, compute_type=COMPUTE_TYPE)
     return _model_cache[name]
 
 
-def _mlx_transcribe(size: str, audio: Any, beam_size: int, word_timestamps: bool,
-                     lenient: bool = False) -> Dict[str, Any]:
+def _mlx_transcribe_once(size: str, audio: Any, beam_size: int) -> EngineResult:
     candidates = [_resolved_mlx_repo[size]] if size in _resolved_mlx_repo else _MLX_REPO_CANDIDATES.get(size, [])
     last_err: Optional[Exception] = None
     for repo in candidates:
         try:
-            kwargs: Dict[str, Any] = dict(
-                path_or_hf_repo=repo, task="transcribe", word_timestamps=word_timestamps,
-            )
-            extra: Dict[str, Any] = {"beam_size": beam_size}
-            if lenient:
-                # Aimed at "dropped too much" feedback on Hindi/code-switch
-                # clips: openai-whisper-style decoding can silently discard
-                # a segment it's not confident about (treating accented or
-                # rapidly-code-switched speech as "no speech" or low
-                # quality). These names mirror openai-whisper's own
-                # transcribe() signature, which mlx-whisper is a port of -
-                # NOT verified against the installed mlx-whisper version,
-                # so this is wrapped in the same defensive TypeError-retry
-                # pattern as beam_size below.
-                extra["no_speech_threshold"] = 0.3     # default ~0.6 - less eager to call it silence
-                extra["logprob_threshold"] = -2.0        # default ~-1.0 - less eager to discard low-confidence text
-                extra["condition_on_previous_text"] = False
             try:
-                result = _mlx_whisper.transcribe(audio, **extra, **kwargs)
+                result = _mlx_whisper.transcribe(
+                    audio, path_or_hf_repo=repo, task="transcribe", beam_size=beam_size,
+                )
             except TypeError:
-                # Some combination of the above isn't supported by this
-                # mlx-whisper version - fall back to just beam_size, then
-                # to nothing extra at all, rather than fail the whole call.
-                try:
-                    result = _mlx_whisper.transcribe(audio, beam_size=beam_size, **kwargs)
-                except TypeError:
-                    result = _mlx_whisper.transcribe(audio, **kwargs)
+                result = _mlx_whisper.transcribe(audio, path_or_hf_repo=repo, task="transcribe")
             _resolved_mlx_repo[size] = repo
-            return result
+            return EngineResult(
+                text=(result.get("text") or "").strip(),
+                language=result.get("language"),
+                engine_name=f"mlx-whisper-{size}",
+            )
         except Exception as e:
             last_err = e
             continue
     raise RuntimeError(f"mlx-whisper: no working repo for size={size}: {last_err}")
 
 
-def _transcribe_core(
-    model_size: str,
-    audio: Any,               # file path (str) or float32 numpy array, mono 16kHz
-    beam_size: int = 5,
-    word_timestamps: bool = False,
-    engine_label: Optional[str] = None,
-    lenient: bool = False,    # True for the Hindi/code-switch pass - see _mlx_transcribe
-) -> EngineResult:
-    """Backend-agnostic transcription used by both batch (this module) and
-    streaming (solution/draft.py) code paths, so both stay consistent and
-    neither needs to know which backend is actually running."""
-    _lazy_imports()
-    t0 = time.perf_counter()
-    label = engine_label or f"{_BACKEND}-{model_size}"
-
-    # Srota tier: only for the Hindi/code-switch model slot, and only
-    # when word-level timestamps aren't needed (Srota's confirmed API
-    # doesn't expose them - in practice this is never a conflict, since
-    # draft.py only ever requests word_timestamps=True for FAST_MODEL_NAME,
-    # never for HINGLISH_MODEL_NAME). Any failure here - missing package,
-    # no compatible device, a bad download, a runtime error - falls
-    # through to the existing mlx/faster-whisper Whisper pipeline below,
-    # exactly like the mlx-to-faster-whisper fallback already does.
-    if model_size == HINGLISH_MODEL_NAME and not word_timestamps and _try_load_srota():
-        try:
-            return _srota_transcribe(audio)
-        except Exception:
-            pass  # fall through to Whisper below - same safety-net pattern as mlx
-
-    if _BACKEND == "mlx":
-        try:
-            result = _mlx_transcribe(model_size, audio, beam_size, word_timestamps, lenient=lenient)
-            text = (result.get("text") or "").strip()
-            language = result.get("language")
-            words: List[Tuple[str, float]] = []
-            if word_timestamps:
-                for seg in result.get("segments", []) or []:
-                    for w in seg.get("words", []) or []:
-                        words.append((str(w.get("word", "")).strip(), float(w.get("end", 0.0))))
-            dt_ms = (time.perf_counter() - t0) * 1000.0
-            return EngineResult(text=text, language=language, language_probability=None,
-                                 duration_ms=dt_ms, engine_name=f"mlx-whisper-{model_size}", words=words)
-        except Exception:
-            # mlx failed for this call (bad repo name, runtime error, etc.) -
-            # fall back to faster-whisper on CPU rather than crash/blank out.
-            pass
-
-    # faster-whisper fallback (also the only path on non-Apple machines)
-    if _WhisperModel is None:
-        from faster_whisper import WhisperModel  # type: ignore
-        globals()["_WhisperModel"] = WhisperModel
-    model = _get_model(model_size)
-    extra_kwargs: Dict[str, Any] = {}
-    if lenient:
-        # Same intent as the mlx branch above: reduce content-dropping on
-        # the harder Hindi/code-switch pass. These ARE the real, documented
-        # faster-whisper parameter names (unlike the mlx ones above, which
-        # are inferred) - this half is on solid ground.
-        extra_kwargs["no_speech_threshold"] = 0.3
-        extra_kwargs["log_prob_threshold"] = -2.0
-        extra_kwargs["vad_parameters"] = {"min_silence_duration_ms": 1000}
+def _faster_whisper_transcribe_once(size: str, audio: Any, beam_size: int) -> EngineResult:
+    model = _get_faster_whisper_model(size)
     segments, info = model.transcribe(
-        audio,
-        task="transcribe",
-        beam_size=beam_size,
-        vad_filter=True,
-        condition_on_previous_text=False,
-        word_timestamps=word_timestamps,
-        **extra_kwargs,
+        audio, task="transcribe", beam_size=beam_size,
+        vad_filter=True, condition_on_previous_text=False,
     )
-    segments = list(segments)
     text = " ".join(seg.text.strip() for seg in segments).strip()
-    words = []
-    if word_timestamps:
-        for seg in segments:
-            for w in (getattr(seg, "words", None) or []):
-                words.append((w.word.strip(), w.end))
-    dt_ms = (time.perf_counter() - t0) * 1000.0
     return EngineResult(
         text=text,
         language=getattr(info, "language", None),
         language_probability=getattr(info, "language_probability", None),
-        duration_ms=dt_ms,
-        engine_name=f"faster-whisper-{model_size}",
-        words=words,
+        engine_name=f"faster-whisper-{size}",
     )
 
 
-def _run_whisper(model_name: str, audio_path: str, engine_label: str, lenient: bool = False) -> EngineResult:
-    return _transcribe_core(model_name, audio_path, beam_size=5, word_timestamps=False,
-                             engine_label=engine_label, lenient=lenient)
+def _transcribe_uncatchable(model_size: str, audio: Any, beam_size: int) -> EngineResult:
+    """The 'real' transcription attempt - may raise. Never call this
+    directly from outside _call_bounded; it has no timeout protection of
+    its own."""
+    _lazy_imports()
+    if _BACKEND == "mlx":
+        try:
+            return _mlx_transcribe_once(model_size, audio, beam_size)
+        except Exception:
+            pass  # fall through to faster-whisper below
+    if _WhisperModel is None:
+        from faster_whisper import WhisperModel  # type: ignore
+        globals()["_WhisperModel"] = WhisperModel
+    return _faster_whisper_transcribe_once(model_size, audio, beam_size)
+
+
+def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float) -> Optional[EngineResult]:
+    """Run a transcription call with a hard wall-clock deadline, on a
+    fresh, disposable DAEMON thread - not a shared pool, and NOT a
+    concurrent.futures.ThreadPoolExecutor.
+
+    Why a raw daemon thread instead of ThreadPoolExecutor: tested this
+    directly rather than assuming. concurrent.futures.ThreadPoolExecutor
+    worker threads are NOT daemon threads, so even after
+    future.result(timeout=X) returns control to us, the underlying
+    thread keeps running AND keeps the whole Python process from being
+    able to exit cleanly - confirmed by direct reproduction, not just
+    reasoning about it. A plain threading.Thread(daemon=True) does not
+    have that problem: the process can move on freely regardless of
+    whether the thread ever finishes.
+
+    Known, real, remaining limitation (Python cannot forcibly kill a
+    thread, full stop): if the underlying call is genuinely stuck doing
+    CPU-bound work, the abandoned thread can still consume real CPU in
+    the background until it eventually finishes on its own, potentially
+    for as long as the process lives. The daemon fix guarantees this
+    can't block or hang anything WE control (this call, this clip, the
+    process exiting) - it does not guarantee zero resource contention
+    with later work. Fully eliminating that would need process-based
+    isolation (a process CAN be forcibly killed), which was deliberately
+    not attempted here: it requires either re-loading the model in every
+    subprocess (slow, defeats the warm-model optimization) or forking a
+    process that already holds a Metal/GPU context (mlx-whisper on
+    Apple Silicon), which is a known-risky pattern that can itself hang
+    or crash and cannot be verified without the actual scoring hardware.
+    Given "completeness first" and no way to test that path, staying
+    with the simpler, verified daemon-thread approach was the deliberate
+    choice here."""
+    result_box: Dict[str, Any] = {}
+
+    def _worker() -> None:
+        try:
+            result_box["value"] = _transcribe_uncatchable(model_size, audio, beam_size)
+        except Exception as e:
+            result_box["error"] = e
+
+    try:
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=max(0.1, deadline_s))
+        if t.is_alive():
+            return None  # timed out - abandon it, daemon=True means this can't block anything of ours
+        return result_box.get("value")
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
-# Post-processing helpers
+# Post-processing - all defensive, never raises
 # ---------------------------------------------------------------------------
 def _romanize(text: str) -> str:
-    """Convert any Devanagari spans to Roman script, word by word, leaving
-    already-Roman text untouched. Keeps the spoken Hindi words - does not
-    translate them into English."""
-    if not DEVANAGARI_RE.search(text):
+    if not text or not DEVANAGARI_RE.search(text):
         return text
-    _lazy_imports()
-    out_tokens = []
-    for token in text.split(" "):
-        if DEVANAGARI_RE.search(token):
-            try:
-                roman = _sanscript.transliterate(
-                    token, _sanscript.DEVANAGARI, _sanscript.ITRANS
-                )
-                # ITRANS uses a few ASCII symbols (^, .a, etc.) for
-                # diacritics; strip the ones that just add noise for casual
-                # dictation text.
-                roman = roman.replace(".a", "a").replace("^", "")
-                out_tokens.append(roman)
-            except Exception:
+    if not _sanscript:
+        return text  # transliteration unavailable - return as-is rather than fail
+    try:
+        out_tokens = []
+        for token in text.split(" "):
+            if DEVANAGARI_RE.search(token):
+                try:
+                    roman = _sanscript.transliterate(token, _sanscript.DEVANAGARI, _sanscript.ITRANS)
+                    roman = roman.replace(".a", "a").replace("^", "")
+                    out_tokens.append(roman)
+                except Exception:
+                    out_tokens.append(token)
+            else:
                 out_tokens.append(token)
-        else:
-            out_tokens.append(token)
-    return " ".join(out_tokens)
+        return " ".join(out_tokens)
+    except Exception:
+        return text
 
 
 def _looks_code_switched(text: str, language: Optional[str], lang_prob: Optional[float]) -> bool:
-    if DEVANAGARI_RE.search(text):
-        return True
-    if language and language != "en" and (lang_prob or 0.0) >= HINDI_PROB_THRESHOLD:
-        return True
-    if language == "en" and lang_prob is not None and lang_prob < EN_CONFIDENCE_THRESHOLD:
-        # low-confidence "English" - could be Hindi mis-heard as English
-        return True
-    lowered = set(re.findall(r"[a-z']+", text.lower()))
-    hits = lowered & HINGLISH_HINT_WORDS
-    return len(hits) >= 2
+    try:
+        if DEVANAGARI_RE.search(text):
+            return True
+        if language and language != "en" and (lang_prob or 0.0) >= HINDI_PROB_THRESHOLD:
+            return True
+        if language == "en" and lang_prob is not None and lang_prob < EN_CONFIDENCE_THRESHOLD:
+            return True
+        lowered = set(re.findall(r"[a-z']+", text.lower()))
+        return len(lowered & HINGLISH_HINT_WORDS) >= 2
+    except Exception:
+        return False
 
 
 def _detect_repetition_loop(text: str) -> bool:
-    words = text.split()
-    if len(words) < REPEAT_NGRAM * REPEAT_MIN_RUNS:
+    try:
+        words = text.split()
+        if len(words) < REPEAT_NGRAM * REPEAT_MIN_RUNS:
+            return False
+        for i in range(len(words) - REPEAT_NGRAM * REPEAT_MIN_RUNS + 1):
+            window = tuple(words[i:i + REPEAT_NGRAM])
+            if all(tuple(words[i + r * REPEAT_NGRAM: i + (r + 1) * REPEAT_NGRAM]) == window
+                   for r in range(1, REPEAT_MIN_RUNS)):
+                return True
         return False
-    for i in range(len(words) - REPEAT_NGRAM * REPEAT_MIN_RUNS + 1):
-        window = tuple(words[i : i + REPEAT_NGRAM])
-        ok = True
-        for r in range(1, REPEAT_MIN_RUNS):
-            nxt = tuple(words[i + r * REPEAT_NGRAM : i + (r + 1) * REPEAT_NGRAM])
-            if nxt != window:
-                ok = False
-                break
-        if ok:
-            return True
-    return False
+    except Exception:
+        return False
 
 
 def _dedupe_repetition(text: str) -> str:
-    """If a repeat loop is detected, cut the text at the first repeat so we
-    return the useful part instead of a wall of repeated gibberish."""
-    words = text.split()
-    n = REPEAT_NGRAM
-    for i in range(len(words) - n * 2 + 1):
-        window = tuple(words[i : i + n])
-        nxt = tuple(words[i + n : i + 2 * n])
-        if window == nxt:
-            return " ".join(words[: i + n])
-    return text
-
-
-def _apply_dictionary(text: str, dictionary_path: Optional[str]) -> Tuple[str, List[str]]:
-    """Optional simple find/replace dictionary for user/domain terms
-    (e.g. product names, acronyms). Not a hidden-answer map: it's an
-    explicit, user-supplied, editable JSON file of {wrong: right} pairs."""
-    if not dictionary_path or not os.path.exists(dictionary_path):
-        return text, []
     try:
-        with open(dictionary_path, "r", encoding="utf-8") as f:
-            terms = json.load(f)
+        words = text.split()
+        n = REPEAT_NGRAM
+        for i in range(len(words) - n * 2 + 1):
+            if tuple(words[i:i + n]) == tuple(words[i + n:i + 2 * n]):
+                return " ".join(words[:i + n])
+        return text
     except Exception:
-        return text, []
-    matched = []
-    for wrong, right in terms.items():
-        pattern = re.compile(rf"\b{re.escape(wrong)}\b", re.IGNORECASE)
-        if pattern.search(text):
-            text = pattern.sub(right, text)
-            matched.append(right)
-    return text, matched
+        return text
 
 
 # ---------------------------------------------------------------------------
-# Core routing logic
+# Eager warmup - runs at import time, before any clip is scored, so
+# nothing is loaded cold during a network-blocked scored run. Wrapped so
+# a warmup failure can NEVER stop the module from importing successfully.
 # ---------------------------------------------------------------------------
-def transcribe(
-    input_path: str,
-    mode: str = "auto",
-    dictionary_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    t_total0 = time.perf_counter()
+def _eager_warmup() -> None:
+    try:
+        silence = np.zeros(int(0.3 * 16000), dtype=np.float32)
+        _call_bounded(FAST_MODEL_NAME, silence, 1, deadline_s=30.0)
+        _call_bounded(HINGLISH_MODEL_NAME, silence, 1, deadline_s=30.0)
+    except Exception:
+        pass
+
+
+_eager_warmup()
+
+
+# ---------------------------------------------------------------------------
+# Core transcription logic
+# ---------------------------------------------------------------------------
+def transcribe(input_path: str, mode: str = "auto", dictionary_path: Optional[str] = None) -> Dict[str, Any]:
+    """Never raises. Always returns a valid result dict, even if every
+    model call fails - completeness (a well-formed response) is the
+    first priority, ahead of accuracy."""
+    t0 = time.perf_counter()
     raw_candidates: List[Dict[str, str]] = []
     model_ids: List[str] = []
     warnings: List[str] = []
+    final_text = ""
+    language_guess = "unknown"
 
-    if mode not in ("auto", "fast", "hinglish", "verbatim"):
-        raise ValueError(f"Unknown mode: {mode}")
+    try:
+        if mode not in ("auto", "fast", "hinglish", "verbatim"):
+            mode = "auto"
 
-    t_asr0 = time.perf_counter()
-
-    final_already_native = False  # True if Srota produced the final text - skip romanization
-
-    if mode == "fast":
-        fast = _run_whisper(FAST_MODEL_NAME, input_path, f"faster-whisper-{FAST_MODEL_NAME}")
-        raw_candidates.append({"engine": fast.engine_name, "text": fast.text})
-        model_ids.append(f"faster-whisper-{FAST_MODEL_NAME}")
-        final_text = fast.text
-        language_guess = fast.language or "unknown"
-        romanize = True
-
-    elif mode in ("hinglish", "verbatim"):
-        strong = _run_whisper(
-            HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
-        )
-        raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
-        model_ids.append(strong.engine_name)
-        final_text = strong.text
-        final_already_native = strong.already_native_script
-        language_guess = "hinglish" if _looks_code_switched(
-            strong.text, strong.language, strong.language_probability
-        ) else (strong.language or "unknown")
-        romanize = mode == "hinglish" and not final_already_native
-
-    else:  # auto
-        fast = _run_whisper(FAST_MODEL_NAME, input_path, f"faster-whisper-{FAST_MODEL_NAME}")
-        raw_candidates.append({"engine": fast.engine_name, "text": fast.text})
-        model_ids.append(f"faster-whisper-{FAST_MODEL_NAME}")
-
-        if _looks_code_switched(fast.text, fast.language, fast.language_probability):
-            strong = _run_whisper(
-                HINGLISH_MODEL_NAME, input_path, f"faster-whisper-{HINGLISH_MODEL_NAME}", lenient=True
-            )
-            raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
-            model_ids.append(strong.engine_name)
-            final_text = strong.text
-            final_already_native = strong.already_native_script
-            language_guess = "hinglish"
-        else:
+        fast = _call_bounded(FAST_MODEL_NAME, input_path, FAST_BEAM_SIZE, FAST_CALL_DEADLINE_S)
+        if fast is not None:
+            raw_candidates.append({"engine": fast.engine_name, "text": fast.text})
+            model_ids.append(fast.engine_name)
             final_text = fast.text
-            language_guess = fast.language or "en"
-        romanize = not final_already_native
+            language_guess = fast.language or "unknown"
+        else:
+            warnings.append("fast_pass_failed_or_timed_out")
 
-    asr_ms = (time.perf_counter() - t_asr0) * 1000.0
+        need_hinglish = mode == "hinglish" or (
+            mode == "auto" and fast is not None and
+            _looks_code_switched(fast.text, fast.language, fast.language_probability)
+        )
+        if mode == "verbatim":
+            need_hinglish = True
 
-    # --- postprocess ---
-    t_post0 = time.perf_counter()
+        if need_hinglish:
+            strong = _call_bounded(HINGLISH_MODEL_NAME, input_path, HINGLISH_BEAM_SIZE, HINGLISH_CALL_DEADLINE_S)
+            if strong is not None and strong.text.strip():
+                raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
+                model_ids.append(strong.engine_name)
+                final_text = strong.text
+                language_guess = "hinglish"
+            else:
+                warnings.append("hinglish_pass_failed_or_timed_out_kept_fast_result")
+                # Deliberately no retry - one bounded attempt only.
 
-    if _detect_repetition_loop(final_text):
-        warnings.append("repetition_loop_detected_and_trimmed")
-        final_text = _dedupe_repetition(final_text)
+        if _detect_repetition_loop(final_text):
+            warnings.append("repetition_loop_detected_and_trimmed")
+            final_text = _dedupe_repetition(final_text)
 
-    if romanize:
-        final_text = _romanize(final_text)
+        if mode != "verbatim":
+            final_text = _romanize(final_text)
 
-    final_text, matched_terms = _apply_dictionary(final_text, dictionary_path)
-    if matched_terms:
-        warnings.append(f"dictionary_terms_applied:{','.join(matched_terms)}")
+        if dictionary_path:
+            final_text, matched = _apply_dictionary(final_text, dictionary_path)
+            if matched:
+                warnings.append(f"dictionary_terms_applied:{','.join(matched)}")
 
-    final_text = re.sub(r"\s+", " ", final_text).strip()
+        final_text = re.sub(r"\s+", " ", final_text).strip()
 
-    postprocess_ms = (time.perf_counter() - t_post0) * 1000.0
-    total_ms = (time.perf_counter() - t_total0) * 1000.0
+    except Exception as e:
+        warnings.append(f"unexpected_error:{type(e).__name__}")
 
-    if final_text == "":
+    if not final_text:
         warnings.append("blank_output")
 
+    total_ms = (time.perf_counter() - t0) * 1000.0
     result = {
         "text": final_text,
         "mode_used": mode,
         "language_guess": language_guess,
-        "timings_ms": {
-            "total": round(total_ms, 1),
-            "asr": round(asr_ms, 1),
-            "postprocess": round(postprocess_ms, 1),
-        },
+        "timings_ms": {"total": round(total_ms, 1)},
         "raw_candidates": raw_candidates,
         "model_ids": model_ids,
         "local_only": True,
@@ -637,49 +414,48 @@ def transcribe(
     return result
 
 
+def _apply_dictionary(text: str, dictionary_path: str) -> Tuple[str, List[str]]:
+    try:
+        if not os.path.exists(dictionary_path):
+            return text, []
+        with open(dictionary_path, "r", encoding="utf-8") as f:
+            terms = json.load(f)
+        matched = []
+        for wrong, right in terms.items():
+            pattern = re.compile(rf"\b{re.escape(wrong)}\b", re.IGNORECASE)
+            if pattern.search(text):
+                text = pattern.sub(right, text)
+                matched.append(right)
+        return text, matched
+    except Exception:
+        return text, []
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Local, offline dual-language (Hindi+English) speech-to-text."
-    )
-    parser.add_argument("--input", required=True, help="Path to a .wav clip")
-    parser.add_argument(
-        "--mode",
-        default="auto",
-        choices=["auto", "fast", "hinglish", "verbatim"],
-        help="auto (default) / fast / hinglish / verbatim",
-    )
-    parser.add_argument("--output", required=True, help="Path to write result.json")
-    parser.add_argument(
-        "--dictionary",
-        default=None,
-        help="Optional path to a JSON {wrong: right} term dictionary",
-    )
+    parser = argparse.ArgumentParser(description="Local, offline dual-language (Hindi+English) speech-to-text.")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--mode", default="auto", choices=["auto", "fast", "hinglish", "verbatim"])
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--dictionary", default=None)
     args = parser.parse_args(argv)
 
     if not os.path.exists(args.input):
         print(f"error: input file not found: {args.input}", file=sys.stderr)
-        return 1
-
-    try:
-        result = transcribe(args.input, mode=args.mode, dictionary_path=args.dictionary)
-    except Exception as exc:  # never crash - emit a diagnosable, blank-safe result
+        # Still write a valid, well-formed blank result rather than just exiting -
+        # completeness of the JSON contract matters even in this edge case.
         result = {
-            "text": "",
-            "mode_used": args.mode,
-            "language_guess": "unknown",
-            "timings_ms": {"total": 0.0, "asr": 0.0, "postprocess": 0.0},
-            "raw_candidates": [],
-            "model_ids": [],
-            "local_only": True,
-            "warnings": [f"exception:{type(exc).__name__}:{exc}"],
+            "text": "", "mode_used": args.mode, "language_guess": "unknown",
+            "timings_ms": {"total": 0.0}, "raw_candidates": [], "model_ids": [],
+            "local_only": True, "warnings": ["input_file_not_found"],
         }
+    else:
+        result = transcribe(args.input, mode=args.mode, dictionary_path=args.dictionary)
 
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
