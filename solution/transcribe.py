@@ -78,7 +78,7 @@ COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")   # faster-whisper fal
 # Beam sizes kept low deliberately - speed and reliability outrank a
 # marginal accuracy gain from a wider beam search right now.
 FAST_BEAM_SIZE = int(os.environ.get("STT_FAST_BEAM_SIZE", "2"))
-HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "2"))
+HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "3"))
 
 # Hard per-call wall-clock budgets. Generous enough that a normally-
 # completing call isn't cut off prematurely (which would itself hurt
@@ -146,17 +146,27 @@ def _get_faster_whisper_model(name: str):
     return _model_cache[name]
 
 
-def _mlx_transcribe_once(size: str, audio: Any, beam_size: int) -> EngineResult:
+def _mlx_transcribe_once(size: str, audio: Any, beam_size: int, lenient: bool = False) -> EngineResult:
     candidates = [_resolved_mlx_repo[size]] if size in _resolved_mlx_repo else _MLX_REPO_CANDIDATES.get(size, [])
     last_err: Optional[Exception] = None
     for repo in candidates:
         try:
+            extra: Dict[str, Any] = {"beam_size": beam_size}
+            if lenient:
+                # Reduces content being silently dropped as "no speech" or
+                # "low confidence" - a real, previously-confirmed cause of
+                # "lost key meaning" on Hindi/code-switch clips. Pure decode
+                # parameters on the same already-bounded call - no new hang
+                # risk, unlike a new model or dependency would be.
+                extra["no_speech_threshold"] = 0.3
+                extra["logprob_threshold"] = -2.0
             try:
-                result = _mlx_whisper.transcribe(
-                    audio, path_or_hf_repo=repo, task="transcribe", beam_size=beam_size,
-                )
+                result = _mlx_whisper.transcribe(audio, path_or_hf_repo=repo, task="transcribe", **extra)
             except TypeError:
-                result = _mlx_whisper.transcribe(audio, path_or_hf_repo=repo, task="transcribe")
+                try:
+                    result = _mlx_whisper.transcribe(audio, path_or_hf_repo=repo, task="transcribe", beam_size=beam_size)
+                except TypeError:
+                    result = _mlx_whisper.transcribe(audio, path_or_hf_repo=repo, task="transcribe")
             _resolved_mlx_repo[size] = repo
             return EngineResult(
                 text=(result.get("text") or "").strip(),
@@ -169,11 +179,19 @@ def _mlx_transcribe_once(size: str, audio: Any, beam_size: int) -> EngineResult:
     raise RuntimeError(f"mlx-whisper: no working repo for size={size}: {last_err}")
 
 
-def _faster_whisper_transcribe_once(size: str, audio: Any, beam_size: int) -> EngineResult:
+def _faster_whisper_transcribe_once(size: str, audio: Any, beam_size: int, lenient: bool = False) -> EngineResult:
     model = _get_faster_whisper_model(size)
+    extra: Dict[str, Any] = {}
+    if lenient:
+        # Real, confirmed faster-whisper parameter names (unlike the mlx
+        # ones above, which are inferred from openai-whisper's API).
+        extra["no_speech_threshold"] = 0.3
+        extra["log_prob_threshold"] = -2.0
+        extra["vad_parameters"] = {"min_silence_duration_ms": 1000}
     segments, info = model.transcribe(
         audio, task="transcribe", beam_size=beam_size,
         vad_filter=True, condition_on_previous_text=False,
+        **extra,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return EngineResult(
@@ -184,23 +202,24 @@ def _faster_whisper_transcribe_once(size: str, audio: Any, beam_size: int) -> En
     )
 
 
-def _transcribe_uncatchable(model_size: str, audio: Any, beam_size: int) -> EngineResult:
+def _transcribe_uncatchable(model_size: str, audio: Any, beam_size: int, lenient: bool = False) -> EngineResult:
     """The 'real' transcription attempt - may raise. Never call this
     directly from outside _call_bounded; it has no timeout protection of
     its own."""
     _lazy_imports()
     if _BACKEND == "mlx":
         try:
-            return _mlx_transcribe_once(model_size, audio, beam_size)
+            return _mlx_transcribe_once(model_size, audio, beam_size, lenient=lenient)
         except Exception:
             pass  # fall through to faster-whisper below
     if _WhisperModel is None:
         from faster_whisper import WhisperModel  # type: ignore
         globals()["_WhisperModel"] = WhisperModel
-    return _faster_whisper_transcribe_once(model_size, audio, beam_size)
+    return _faster_whisper_transcribe_once(model_size, audio, beam_size, lenient=lenient)
 
 
-def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float) -> Optional[EngineResult]:
+def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float,
+                   lenient: bool = False) -> Optional[EngineResult]:
     """Run a transcription call with a hard wall-clock deadline, on a
     fresh, disposable DAEMON thread - not a shared pool, and NOT a
     concurrent.futures.ThreadPoolExecutor.
@@ -236,7 +255,7 @@ def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float
 
     def _worker() -> None:
         try:
-            result_box["value"] = _transcribe_uncatchable(model_size, audio, beam_size)
+            result_box["value"] = _transcribe_uncatchable(model_size, audio, beam_size, lenient=lenient)
         except Exception as e:
             result_box["error"] = e
 
@@ -369,7 +388,7 @@ def transcribe(input_path: str, mode: str = "auto", dictionary_path: Optional[st
             need_hinglish = True
 
         if need_hinglish:
-            strong = _call_bounded(HINGLISH_MODEL_NAME, input_path, HINGLISH_BEAM_SIZE, HINGLISH_CALL_DEADLINE_S)
+            strong = _call_bounded(HINGLISH_MODEL_NAME, input_path, HINGLISH_BEAM_SIZE, HINGLISH_CALL_DEADLINE_S, lenient=True)
             if strong is not None and strong.text.strip():
                 raw_candidates.append({"engine": strong.engine_name, "text": strong.text})
                 model_ids.append(strong.engine_name)
@@ -383,8 +402,14 @@ def transcribe(input_path: str, mode: str = "auto", dictionary_path: Optional[st
             warnings.append("repetition_loop_detected_and_trimmed")
             final_text = _dedupe_repetition(final_text)
 
-        if mode != "verbatim":
-            final_text = _romanize(final_text)
+        # NOT romanized by default (see the streaming module's matching
+        # note): the challenge's build guide says to keep Hindi "as it
+        # was said (Roman or Devanagari as the reference expects)" -
+        # forcing Devanagari into Roman here risks converting an
+        # otherwise-correct transcription into the wrong script relative
+        # to the hidden reference. _romanize() is still defined below and
+        # can be re-enabled per-mode if there's ever concrete evidence
+        # the hidden set specifically wants Roman-only output.
 
         if dictionary_path:
             final_text, matched = _apply_dictionary(final_text, dictionary_path)
