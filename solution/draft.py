@@ -92,6 +92,31 @@ def _bytes_to_f32(buf: bytes) -> np.ndarray:
     return arr.astype(np.float32) / 32768.0
 
 
+def _is_near_silent(audio: np.ndarray, rms_threshold: float = 0.004) -> bool:
+    """Conservative near-silence check. Whisper-family models are known
+    to hallucinate confident-sounding but unrelated text on near-empty
+    or silent audio (a well-documented failure mode, not unique to this
+    pipeline). Skipping transcription entirely on genuinely near-silent
+    audio and returning blank is safer than risking a hallucinated
+    'unrelated to the audio' result, which the scoring rules cap
+    similarly to blank anyway but can additionally risk a worse
+    critical-fact-flip if the hallucinated text happens to include a
+    fabricated number or name.
+
+    Deliberately conservative (very low threshold): the goal is to catch
+    true silence/near-silence, not quiet-but-real speech - being too
+    aggressive here would trade one failure mode (hallucination) for
+    another (blanking legitimately quiet audio), which would not
+    actually be progress."""
+    try:
+        if audio.size == 0:
+            return True
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        return rms < rms_threshold
+    except Exception:
+        return False  # uncertain - don't skip transcription on a measurement error
+
+
 def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     """Exactly one attempt at the fast model (skipped entirely if a
     partial already told us this is Hindi/code-switched - a real,
@@ -101,6 +126,9 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
     string (never raises)."""
     text = ""
     try:
+        if _is_near_silent(full_audio):
+            return ""  # known, safe blank - see _is_near_silent's docstring for why
+
         if hint_code_switched:
             strong = _call_bounded(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
                                     HINGLISH_FINAL_DEADLINE_S, lenient=True)
@@ -117,12 +145,26 @@ def _run_final(full_audio: np.ndarray, hint_code_switched: bool = False) -> str:
             fast_text = fast.text if fast else ""
             text = fast_text
 
-            if fast is not None and _looks_code_switched(fast_text, fast.language, fast.language_probability):
+            # CHANGED after organizer feedback ("one clip returned a
+            # blank final"): previously this only tried the Hindi model
+            # when the fast pass succeeded AND looked code-switched - if
+            # the fast pass failed/timed out entirely (fast is None),
+            # there was no second attempt at all, guaranteeing a blank
+            # final. Now a failed or blank fast pass ALSO triggers one
+            # Hindi attempt, since a failure gives us no information to
+            # route on - trying the alternative model is the safe
+            # default rather than giving up. Still only one Hindi
+            # attempt total, no retries.
+            should_try_hindi = (
+                fast is None or not fast_text.strip() or
+                _looks_code_switched(fast_text, fast.language, fast.language_probability)
+            )
+            if should_try_hindi:
                 strong = _call_bounded(HINGLISH_MODEL_NAME, full_audio, HINGLISH_BEAM_SIZE,
                                         HINGLISH_FINAL_DEADLINE_S, lenient=True)
                 if strong is not None and strong.text.strip():
                     text = strong.text
-                # else: keep fast_text - no retry, no second Hindi attempt
+                # else: keep fast_text (possibly still "") - no retry
 
         if _detect_repetition_loop(text):
             text = _dedupe_repetition(text)

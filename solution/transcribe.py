@@ -78,7 +78,12 @@ COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "int8")   # faster-whisper fal
 # Beam sizes kept low deliberately - speed and reliability outrank a
 # marginal accuracy gain from a wider beam search right now.
 FAST_BEAM_SIZE = int(os.environ.get("STT_FAST_BEAM_SIZE", "2"))
-HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "3"))
+HINGLISH_BEAM_SIZE = int(os.environ.get("STT_HINGLISH_BEAM_SIZE", "4"))  # bumped again (3 -> 4):
+                                                                          # recent feedback rounds
+                                                                          # haven't flagged speed,
+                                                                          # only accuracy on hard
+                                                                          # clips - spending the
+                                                                          # available headroom here
 
 # Hard per-call wall-clock budgets. Generous enough that a normally-
 # completing call isn't cut off prematurely (which would itself hurt
@@ -87,8 +92,15 @@ FAST_CALL_DEADLINE_S = float(os.environ.get("STT_FAST_DEADLINE_S", "6.0"))
 HINGLISH_CALL_DEADLINE_S = float(os.environ.get("STT_HINGLISH_DEADLINE_S", "6.0"))
 
 DEVANAGARI_RE = re.compile(r"[\u0900-\u097F]")
-HINDI_PROB_THRESHOLD = 0.12
-EN_CONFIDENCE_THRESHOLD = 0.65
+HINDI_PROB_THRESHOLD = 0.10  # loosened slightly (was 0.12) - escalate on weaker Hindi signal
+EN_CONFIDENCE_THRESHOLD = 0.75  # raised (was 0.65) - a wider band of "not fully sure it's
+                                 # English" now escalates to the Hindi pass. Changed after
+                                 # organizer feedback narrowed the failures to specifically
+                                 # "very hard clips" - the plausible read is fast/heavy
+                                 # code-switching that leaves the fast model's own language
+                                 # detection only moderately confident, previously not
+                                 # triggering escalation. Costs a bit more latency on
+                                 # borderline clips, which there's headroom for.
 HINGLISH_HINT_WORDS = {
     "hai", "hain", "kar", "karo", "kya", "nahi", "nahin", "ka", "ki", "ke",
     "yeh", "woh", "mein", "aur", "bhi", "toh", "kro", "acha", "theek",
@@ -304,7 +316,9 @@ def _looks_code_switched(text: str, language: Optional[str], lang_prob: Optional
         if language == "en" and lang_prob is not None and lang_prob < EN_CONFIDENCE_THRESHOLD:
             return True
         lowered = set(re.findall(r"[a-z']+", text.lower()))
-        return len(lowered & HINGLISH_HINT_WORDS) >= 2
+        return len(lowered & HINGLISH_HINT_WORDS) >= 1  # loosened from 2 - one clear Hinglish
+                                                          # function word is enough signal on a
+                                                          # hard/fast clip to be worth escalating
     except Exception:
         return False
 
