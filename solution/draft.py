@@ -22,10 +22,13 @@ from solution.transcribe import (
     FALLBACK_MODEL_NAME,
     FAST_BEAM_SIZE,
     HINGLISH_BEAM_SIZE,
+    FAST_CALL_DEADLINE_S,
     HINGLISH_CALL_DEADLINE_S,
     FALLBACK_CALL_DEADLINE_S,
     _call_bounded,
+    _call_bounded_ex,
     _looks_code_switched,
+    _looks_code_switched_text,
     _detect_repetition_loop,
     _dedupe_repetition,
     normalize_final,
@@ -38,6 +41,14 @@ MIN_WALL_INTERVAL_S = 0.7
 TOTAL_FINAL_BUDGET_S = 1.8
 PARTIAL_DEADLINE_S = 0.8
 
+# Partials only need to be fast and roughly right, not perfect — so unlike the
+# is_final pass (which always transcribes the whole buffer for a correct
+# result), partial ticks transcribe only the trailing window of audio. Without
+# this, transcription cost grows with utterance length: a 30s utterance would
+# re-transcribe ~30s of audio on every ~0.7s tick, and late-utterance partials
+# would blow PARTIAL_DEADLINE_S far more often than early ones.
+PARTIAL_WINDOW_S = 8.0
+
 
 class StreamingState:
     def __init__(self) -> None:
@@ -49,6 +60,8 @@ class StreamingState:
         self.live_draft: str = ""
         self.is_hinglish: bool = False
         self.last_run_wall: float = 0.0
+        self.partial_thread: threading.Thread | None = None
+        self.prev_live_draft: str = ""
 
 
 state = StreamingState()
@@ -56,11 +69,16 @@ state = StreamingState()
 
 def draft_reset(*_args: Any, **_kwargs: Any) -> None:
     global state
-    try:
-        state = StreamingState()
-    except Exception:
-        pass
+    state = StreamingState()
     return None
+
+
+def _common_prefix_len(a: str, b: str) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
 
 
 def _bytes_to_f32(buf: bytes) -> np.ndarray:
@@ -128,11 +146,14 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
                 state.final_text = ""
                 return "", 0
 
-            # Determine route
-            if state.is_hinglish or _looks_code_switched(state.live_draft, "hi", 1.0):
+            # Determine route. Use the text-only heuristic here: state.live_draft
+            # has no associated ASR language/confidence, so there's no real
+            # language signal to pass into _looks_code_switched (see its
+            # docstring in transcribe.py for why faking one always returns True).
+            if state.is_hinglish or _looks_code_switched_text(state.live_draft):
                 final_res = get_final_hinglish(full_audio, state.live_draft)
             else:
-                eng_res = _call_bounded(FAST_MODEL_NAME, full_audio, FAST_BEAM_SIZE, 0.6)
+                eng_res = _call_bounded(FAST_MODEL_NAME, full_audio, FAST_BEAM_SIZE, FAST_CALL_DEADLINE_S)
                 if eng_res and eng_res.text.strip():
                     if _looks_code_switched(eng_res.text, eng_res.language, eng_res.language_probability):
                         final_res = get_final_hinglish(full_audio, state.live_draft)
@@ -150,20 +171,35 @@ def draft(audio_buffer: bytes, is_final: bool) -> Tuple[str, int]:
         if state.final_text:
             return state.final_text, len(state.final_text)
 
+        # Never start a new partial call while a previous one is still running
+        # in the background (it can't be cancelled on timeout — see
+        # _call_bounded_ex's docstring) — otherwise timed-out calls stack up
+        # and compete with each new one for the same CPU.
+        if state.partial_thread is not None and state.partial_thread.is_alive():
+            return state.live_draft, _common_prefix_len(state.live_draft, state.prev_live_draft)
+
         now = time.perf_counter()
         new_samples = len(full_audio) - state.committed_samples
         if (new_samples / SAMPLE_RATE) < MIN_NEW_AUDIO_S or (now - state.last_run_wall) < MIN_WALL_INTERVAL_S:
-            return state.live_draft, len(state.live_draft)
+            return state.live_draft, _common_prefix_len(state.live_draft, state.prev_live_draft)
 
         state.last_run_wall = now
-        res = _call_bounded(FALLBACK_MODEL_NAME, full_audio, 1, PARTIAL_DEADLINE_S, is_hinglish=True)
+        window_samples = int(PARTIAL_WINDOW_S * SAMPLE_RATE)
+        window_audio = full_audio[-window_samples:] if len(full_audio) > window_samples else full_audio
+        thread, res = _call_bounded_ex(FALLBACK_MODEL_NAME, window_audio, 1, PARTIAL_DEADLINE_S, is_hinglish=True)
+        state.partial_thread = thread
         if res and res.text.strip():
+            state.prev_live_draft = state.live_draft
             state.live_draft = res.text.strip()
             state.committed_samples = len(full_audio)
             if _looks_code_switched(state.live_draft, res.language, res.language_probability):
                 state.is_hinglish = True
 
-        return state.live_draft, len(state.live_draft)
+        # stable_chars is the length of the prefix shared with the *previous*
+        # tick's draft — i.e. text the model has agreed on twice in a row —
+        # not the whole (regenerated-from-scratch) draft, which can still
+        # change on the next call.
+        return state.live_draft, _common_prefix_len(state.live_draft, state.prev_live_draft)
 
     except Exception:
         safe_text = state.final_text or state.live_draft

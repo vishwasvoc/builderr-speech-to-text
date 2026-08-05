@@ -248,8 +248,18 @@ def _transcribe_uncatchable(model_size: str, audio: Any, beam_size: int, is_hing
     return _faster_whisper_transcribe_once(model_size, padded_audio, beam_size, is_hinglish=is_hinglish, logprob_override=logprob_override)
 
 
-def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float,
-                   is_hinglish: bool = False, logprob_override: Optional[float] = None) -> Optional[EngineResult]:
+def _call_bounded_ex(model_size: str, audio: Any, beam_size: int, deadline_s: float,
+                      is_hinglish: bool = False, logprob_override: Optional[float] = None
+                      ) -> Tuple[Optional[threading.Thread], Optional[EngineResult]]:
+    """Like `_call_bounded`, but also returns the worker thread.
+
+    The underlying inference call cannot be cancelled once started — on timeout
+    the thread just keeps running in the background. Callers that fire these
+    calls on a repeating cadence (e.g. streaming partials) should hold onto the
+    returned thread and check `.is_alive()` before starting another call on the
+    same resource, instead of relying only on a wall-clock throttle, so a slow
+    call can't have a second (and third...) call stacked on top of it.
+    """
     result_box: Dict[str, Any] = {}
 
     def _worker() -> None:
@@ -265,10 +275,18 @@ def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float
         t.start()
         t.join(timeout=max(0.05, deadline_s))
         if t.is_alive():
-            return None
-        return result_box.get("value")
+            return t, None
+        return t, result_box.get("value")
     except Exception:
-        return None
+        return None, None
+
+
+def _call_bounded(model_size: str, audio: Any, beam_size: int, deadline_s: float,
+                   is_hinglish: bool = False, logprob_override: Optional[float] = None) -> Optional[EngineResult]:
+    _, result = _call_bounded_ex(
+        model_size, audio, beam_size, deadline_s, is_hinglish=is_hinglish, logprob_override=logprob_override
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +299,27 @@ def _looks_code_switched(text: str, language: Optional[str], lang_prob: Optional
         if language and language != "en" and (lang_prob or 0.0) >= HINDI_PROB_THRESHOLD:
             return True
         if language == "en" and lang_prob is not None and lang_prob < EN_CONFIDENCE_THRESHOLD:
+            return True
+        lowered = set(re.findall(r"[a-z']+", text.lower()))
+        return len(lowered & HINGLISH_HINT_WORDS) >= 1
+    except Exception:
+        return False
+
+
+def _looks_code_switched_text(text: str) -> bool:
+    """Text-only code-switch heuristic: Devanagari script or Hinglish hint words.
+
+    Use this (instead of `_looks_code_switched`) when no ASR-reported
+    `language`/`language_probability` is available for the text being checked —
+    e.g. checking a rolling live draft rather than a fresh model result.
+    Passing a fabricated `language` into `_looks_code_switched` to reuse it here
+    is wrong: `_looks_code_switched` short-circuits to True whenever
+    `language != "en"` and `lang_prob >= HINDI_PROB_THRESHOLD`, independent of
+    the text, so a call like `_looks_code_switched(text, "hi", 1.0)` returns
+    True unconditionally.
+    """
+    try:
+        if DEVANAGARI_RE.search(text):
             return True
         lowered = set(re.findall(r"[a-z']+", text.lower()))
         return len(lowered & HINGLISH_HINT_WORDS) >= 1
